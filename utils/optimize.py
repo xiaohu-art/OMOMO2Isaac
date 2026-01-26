@@ -234,10 +234,6 @@ class HandOptimizer:
                 trans=self.trans
             )
             
-            # Compute Losses
-            loss_dict = {}
-            total_loss = 0.0
-            
             # Left Hand Loss
             l_loss, l_info = self._compute_single_hand_loss(
                 smpl_out, is_right=False, masks=masks['left'], epoch=epoch
@@ -326,7 +322,7 @@ class HandOptimizer:
             # Penetration mask: dist < 0
             mask_pen = (sd_region < 0)
             
-            # Only punish if frame needs optimization (w_touch_lin > 0 implicitly handled by logic?)
+            # Only punish if frame needs optimization
             # Logic borrowed from original: if any vertex penetrates in frame
             mask_frame_pen = mask_pen.any(dim=-1)
             
@@ -367,9 +363,6 @@ class HandOptimizer:
         # 4. Regularization (Temporal & Mean Pose)
         loss_reg = torch.tensor(0.0, device=self.device)
         if epoch > 100:
-            w_opt = masks['opt']
-            w_strict = masks['strict']
-            
             # Smoothness
             loss_reg += smooth_loss(h_params, h_verts) * 0.5
             
@@ -382,9 +375,7 @@ class HandOptimizer:
             # Flatten to [Batch, 45] (15 joints * 3)
             flat_pose = h_params.contiguous().view(-1, 45)
             # Prior model expects specific format. 
-            # Note: The original code passed `left_or_right` int flag. 0=Left, 1=Right
             prior_loss = self.res.prior_model(flat_pose, left_or_right=int(is_right))
-            # Original code squared the output of prior model
             loss_reg += 0.1 * torch.sum(prior_loss**2 * masks['opt'])
 
         total = loss_coll + loss_attr + loss_rom + loss_reg
@@ -507,25 +498,26 @@ def calculate_contact_masks(hand_verts, obj_verts, obj_normals):
     
     return w_strict, w_linear, w_opt
 
+@torch.jit.script
 def restrict_angles_loss(theta, theta_max, theta_min):
     diff_max = (theta - theta_max).clamp(min=0)
     diff_min = (theta_min - theta).clamp(min=0)
     return torch.sum(diff_max ** 2) + torch.sum(diff_min ** 2)
 
+@torch.jit.script
 def smooth_loss(params, verts):
     # Params Smoothness
     diff1 = params[1:] - params[:-1]
     loss = 0.5 * torch.sum(diff1 ** 2)
-    
-    if params.shape[0] > 2:
-        diff2 = diff1[1:] - diff1[:-1]
-        loss += 0.25 * torch.sum(diff2 ** 2)
 
     # Vertex Smoothness
     v_diff1 = verts[1:] - verts[:-1]
     loss += 0.5 * torch.sum(v_diff1 ** 2)
     
     if params.shape[0] > 2:
+        diff2 = diff1[1:] - diff1[:-1]
+        loss += 0.25 * torch.sum(diff2 ** 2)
+    
         v_diff2 = v_diff1[1:] - v_diff1[:-1]
         loss += 0.25 * torch.sum(v_diff2 ** 2)
 

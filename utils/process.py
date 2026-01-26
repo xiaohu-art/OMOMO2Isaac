@@ -109,7 +109,13 @@ def process_single_sequence(human_data, object_data, smpl_model, visualize=False
     ], axis=1)
 
     if visualize:
-        visualize_with_viser(optimized_verts, optimized_faces, obj_verts, obj_faces, obj_trans, obj_rot)
+        visualize_with_viser(
+            optimized_verts, optimized_faces, 
+            obj_verts, obj_faces, 
+            obj_trans, obj_rot,
+            keypoints,
+            contacts
+        )
 
     result_obj = {
         'rot': np.array(obj_rot),
