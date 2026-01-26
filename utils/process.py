@@ -3,7 +3,9 @@ import torch
 import trimesh
 import numpy as np
 
-from .cli_args import SMPLX_PATH, OBJECTS_PATH, DEVICE
+from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
+
+from .cli_args import SMPLX_PATH, OBJECTS_PATH, SMPLX_ROBOTS_PATH, DEVICE
 from .visualization import visualize_with_viser
 from .optimize import optimize_hand
 
@@ -24,6 +26,51 @@ def get_smpl_parents(gender, use_joints24=False):
         parents[0] = -1  # Assign -1 for the root joint's parent idx.
 
     return parents
+
+def generate_subject_xml(betas, gender, human_xml_path):
+    """
+    Generate MuJoCo XML for a specific subject based on betas and gender.
+    """
+    gender_val = 1 if gender == 'male' else 2 if gender == 'female' else 0
+
+    gender_beta = np.zeros(17)
+    gender_beta[0] = gender_val
+    gender_beta[1:] = betas[:16]
+
+    robot_cfg = {
+        "mesh": False,
+        "rel_joint_lm": True,
+        "upright_start": False,
+        "remove_toe": False,
+        "real_weight": True,
+        "real_weight_porpotion_capsules": True,
+        "real_weight_porpotion_boxes": True,
+        "replace_feet": True,
+        "big_ankle": False,
+        "freeze_hand": False,
+        "box_body": False,
+        "body_params": {},
+        "joint_params": {},
+        "geom_params": {},
+        "actuator_params": {},
+        "model": "smplx",
+        "ball_joint": False,
+        "create_vel_sensors": False,  # Create global and local velocities sensors.
+        "sim": "isaacgym"
+    }
+
+    # Initialize SMPL_Robot
+    smpl_robot = SMPL_Robot(robot_cfg, data_dir=SMPLX_PATH)
+    
+    # Load skeleton from parameters
+    smpl_robot.load_from_skeleton(
+        betas=torch.from_numpy(gender_beta[None, 1:]).float(),
+        gender=torch.from_numpy(gender_beta[0:1]).float()
+    )
+    
+    os.makedirs(os.path.dirname(SMPLX_ROBOTS_PATH), exist_ok=True)
+    smpl_robot.write_xml(os.path.join(SMPLX_ROBOTS_PATH, human_xml_path))
+    # print(f"Generated XML: {human_xml_path}")
 
 # -----------------------------------------------------------------------------
 # Core Pipeline

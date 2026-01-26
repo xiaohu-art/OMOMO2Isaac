@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "human-body-prior",
     "joblib>=1.5.3",
+    "smpl-sim",
     "tqdm>=4.67.1",
     "trimesh>=4.11.1",
     "viser>=1.0.21",
@@ -14,3 +15,4 @@ dependencies = [
 
 [tool.uv.sources]
 human-body-prior = { git = "https://github.com/nghorbani/human_body_prior.git" }
+smpl-sim = { git = "https://github.com/ZhengyiLuo/SMPLSim.git" }

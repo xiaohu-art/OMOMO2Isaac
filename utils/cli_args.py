@@ -7,9 +7,11 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 
 DATA_ROOT = str(_PROJECT_ROOT / "data")
 MODELS_ROOT = str(_PROJECT_ROOT / "models")
+ROBOTS_ROOT = str(_PROJECT_ROOT / "robots")
 
 OBJECTS_PATH = str(Path(DATA_ROOT) / "objects")
 SMPLX_PATH = str(Path(MODELS_ROOT) / "smplx")
+SMPLX_ROBOTS_PATH = str(Path(ROBOTS_ROOT) / "smplx")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

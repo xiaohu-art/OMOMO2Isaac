@@ -4,14 +4,17 @@ import numpy as np
 from tqdm import tqdm
 from human_body_prior.body_model.body_model import BodyModel
 
-# from omomo_utils import process_single_sequence, rotate_at_frame_w_obj, get_smpl_parents
 from utils.cli_args import DATA_ROOT, OBJECTS_PATH, SMPLX_PATH, parse_args
 from utils.math import (
     quat_from_angle_axis, quat_from_matrix,
     matrix_from_quat, axis_angle_from_quat,
     rotate_at_frame_w_obj
 )
-from utils.process import get_smpl_parents, process_single_sequence
+from utils.process import (
+    get_smpl_parents,
+    generate_subject_xml,
+    process_single_sequence,
+)
 
 OUTPUT_PATH = "sequences"
 
@@ -122,6 +125,7 @@ def main():
     for index in pbar:
         seq_entry = data_dict[index]
         seq_name = seq_entry['seq_name']
+        subject_name = seq_name.split("_")[0]
         object_name = seq_name.split("_")[1]
         
         pbar.set_description(f"Processing {seq_name}")
@@ -130,12 +134,17 @@ def main():
             continue
         
         gender = str(seq_entry['gender'])
+        betas = seq_entry['betas'][0]
+
+        xml_filename = f"{subject_name}.xml"
+        if not os.path.exists(xml_filename):
+            generate_subject_xml(betas, gender, xml_filename)
 
         new_poses, new_trans, new_obj_rot, new_obj_trans = canonicalize_sequence(seq_entry, gender)
         
         human_input = {
             'poses': new_poses,
-            'betas': seq_entry['betas'][0],
+            'betas': betas,
             'trans': new_trans,
             'gender': gender,
         }
