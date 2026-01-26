@@ -1,0 +1,16 @@
+[project]
+name = "pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "human-body-prior",
+    "joblib>=1.5.3",
+    "tqdm>=4.67.1",
+    "trimesh>=4.11.1",
+    "viser>=1.0.21",
+]
+
+[tool.uv.sources]
+human-body-prior = { git = "https://github.com/nghorbani/human_body_prior.git" }
