@@ -3,7 +3,15 @@ import trimesh
 import joblib
 from tqdm import tqdm
 
-from cli_args import parse_args, DATA_ROOT
+import pyrootutils
+root = pyrootutils.setup_root(
+    search_from=__file__,
+    indicator=[".git", "pyproject.toml"],
+    pythonpath=True,
+    dotenv=True,
+)
+
+from utils.cli_args import parse_args, DATA_ROOT
 
 def main():
     """Main processing function."""

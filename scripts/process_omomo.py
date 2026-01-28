@@ -12,7 +12,7 @@ root = pyrootutils.setup_root(
     dotenv=True,
 )
 
-from utils.cli_args import DATA_ROOT, OBJECTS_PATH, SMPLX_PATH, parse_args
+from utils.cli_args import DATA_ROOT, OUTPUT_PATH, SMPLX_PATH, parse_args
 from utils.math import (
     quat_from_angle_axis, quat_from_matrix,
     matrix_from_quat, axis_angle_from_quat,
@@ -23,8 +23,6 @@ from utils.process import (
     generate_subject_xml,
     process_single_sequence,
 )
-
-OUTPUT_PATH = "sequences"
 
 def load_smpl_models(smplx_path):
     models = {}
@@ -179,6 +177,8 @@ def main():
             'human': processed_human,
             'object': processed_obj,
         }
+
+        break
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     output_file = os.path.join(OUTPUT_PATH, f'{args.flag}_sequences.pkl')

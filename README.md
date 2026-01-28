@@ -151,10 +151,7 @@ Processed sequences are saved as pickle files with the following structure:
 }
 ```
 
-**Note:** All coordinates are normalized such that the minimum Z-coordinate is aligned to 0.
-
 ## Citation
 
 - OMOMO dataset
 - SMPLX model
-- Hand optimization techniques
