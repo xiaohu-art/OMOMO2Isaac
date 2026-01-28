@@ -4,6 +4,14 @@ import numpy as np
 from tqdm import tqdm
 from human_body_prior.body_model.body_model import BodyModel
 
+import pyrootutils
+root = pyrootutils.setup_root(
+    search_from=__file__,
+    indicator=[".git", "pyproject.toml"],
+    pythonpath=True,
+    dotenv=True,
+)
+
 from utils.cli_args import DATA_ROOT, OBJECTS_PATH, SMPLX_PATH, parse_args
 from utils.math import (
     quat_from_angle_axis, quat_from_matrix,

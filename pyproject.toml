@@ -1,12 +1,14 @@
 [project]
 name = "pipeline"
 version = "0.1.0"
-description = "Add your description here"
+description = "Pipeline to process OMOMO dataset, generate corresponding smplx robot, and retarget to specific humanoid robot"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "human-body-prior",
     "joblib>=1.5.3",
+    "mujoco>=3.4.0",
+    "pyrootutils>=1.0.4",
     "smpl-sim",
     "tqdm>=4.67.1",
     "trimesh>=4.11.1",
