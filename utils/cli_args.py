@@ -15,6 +15,7 @@ SMPLX_PATH = str(Path(MODELS_ROOT) / "smplx")
 OUTPUT_PATH = str(_PROJECT_ROOT / "sequences")
 
 SMPLX_ROBOTS_PATH = str(Path(ROBOTS_ROOT) / "smplx")
+G1_PATH = str(Path(ROBOTS_ROOT) / "unitree_g1")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

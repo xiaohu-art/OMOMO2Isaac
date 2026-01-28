@@ -71,6 +71,37 @@ uv run scripts/process_omomo.py --flag test --visualize
 - Processed sequences saved to `sequences/{flag}_sequences.pkl`
 - Generated robot XML files in `robots/smplx/`
 
+### 3. Visualize Sequences in MuJoCo
+
+After generating the SMPLX robot XMLs and processed sequences, you can visualize the human–object interaction in MuJoCo using `scripts/vis_mujoco.py`:
+
+```bash
+uv run scripts/vis_mujoco.py
+```
+
+This script:
+- **Loads** a processed sequence (default: `sequences/example.pkl`)
+- **Builds** a combined MuJoCo scene with the SMPLX humanoid and the object mesh
+- **Converts** SMPLH pose parameters to the MuJoCo joint
+- **Plays back** the motion with keyboard controls:
+  - **UP arrow**: Previous motion
+  - **DOWN arrow**: Next motion
+
+Example MuJoCo visualization:
+
+![MuJoCo visualization](teaser/vis_mujoco.png)
+
+### 4. Retarget to Humanoid Robot
+
+Retarget the processed sequences to a specific humanoid robot:
+
+```bash
+uv run scripts/humanoid_retarget.py
+```
+
+**Options:**
+- `--visualize`: Enable 3D visualization with viser
+
 ## Project Structure
 
 ```

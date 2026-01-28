@@ -9,11 +9,13 @@ dependencies = [
     "joblib>=1.5.3",
     "mujoco>=3.4.0",
     "pyrootutils>=1.0.4",
+    "pytorch-kinematics>=0.7.6",
     "smpl-sim",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
     "trimesh>=4.11.1",
     "viser>=1.0.21",
+    "yourdfpy>=0.0.60",
 ]
 
 [[tool.uv.index]]
