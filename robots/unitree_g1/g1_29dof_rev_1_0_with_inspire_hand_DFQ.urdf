@@ -1102,6 +1102,25 @@
     <mimic joint="L_thumb_proximal_pitch_joint" multiplier="2.4" offset="0"/>
   </joint>
 
+  <link name="L_thumb_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="L_thumb_tip_joint" type="fixed">
+    <parent link="L_thumb_distal"/>
+    <child link="L_thumb_tip"/>
+    <origin rpy="0 0 0" xyz="0.0159104 -0.0156076 -0.00599021"/>
+  </joint>
+
   <link name="L_index_proximal">
     <inertial>
       <origin xyz="0.0012971 -0.011934 -0.0059998" rpy="0 0 0"/>
@@ -1155,6 +1174,25 @@
       </geometry>
     </collision>
   </link>
+
+  <link name="L_index_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="L_index_tip_joint" type="fixed">
+    <parent link="L_index_intermediate"/>
+    <child link="L_index_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00412053 -0.0433132 -0.00501047"/>
+  </joint>
 
   <joint name="L_index_intermediate_joint" type="revolute">
     <origin xyz="-0.0024229 -0.032041 -0.001" rpy="0 0 0"/>
@@ -1228,6 +1266,25 @@
     <mimic joint="L_middle_proximal_joint" multiplier="1" offset="0"/>
   </joint>
 
+  <link name="L_middle_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="L_middle_tip_joint" type="fixed">
+    <parent link="L_middle_intermediate"/>
+    <child link="L_middle_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00426879 -0.0466043 -0.00498678"/>
+  </joint>
+
   <link name="L_ring_proximal">
     <inertial>
       <origin xyz="0.0012971 -0.011934 -0.0059999" rpy="0 0 0"/>
@@ -1291,6 +1348,25 @@
     <mimic joint="L_ring_proximal_joint" multiplier="1" offset="0"/>
   </joint>
 
+  <link name="L_ring_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="L_ring_tip_joint" type="fixed">
+    <parent link="L_ring_intermediate"/>
+    <child link="L_ring_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00366554 -0.0433541 -0.00501047"/>
+  </joint>
+
   <link name="L_pinky_proximal">
     <inertial>
       <origin xyz="0.0012971 -0.011934 -0.0059999" rpy="0 0 0"/>
@@ -1352,6 +1428,25 @@
     <axis xyz="0 0 -1"/>
     <limit lower="0" upper="1.7" effort="1" velocity="0.5"/>
     <mimic joint="L_pinky_proximal_joint" multiplier="1" offset="0"/>
+  </joint>
+
+  <link name="L_pinky_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="L_pinky_tip_joint" type="fixed">
+    <parent link="L_pinky_intermediate"/>
+    <child link="L_pinky_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00260734 -0.0362776 -0.00501047"/>
   </joint>
 
   <joint name="R_base_link_joint" type="fixed">
@@ -1509,6 +1604,25 @@
     <mimic joint="R_thumb_proximal_pitch_joint" multiplier="2.4" offset="0"/>
   </joint>
 
+  <link name="R_thumb_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="R_thumb_tip_joint" type="fixed">
+    <parent link="R_thumb_distal"/>
+    <child link="R_thumb_tip"/>
+    <origin rpy="0 0 0" xyz="0.0159104 0.0156076 -0.00599021"/>
+  </joint>
+
   <link name="R_index_proximal">
     <inertial>
       <origin xyz="0.0012259 0.011942 -0.0060001" rpy="0 0 0"/>
@@ -1570,6 +1684,25 @@
     <axis xyz="0 0 1"/>
     <limit lower="0" upper="1.7" effort="1" velocity="0.5"/>
     <mimic joint="R_index_proximal_joint" multiplier="1" offset="0"/>
+  </joint>
+
+  <link name="R_index_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="R_index_tip_joint" type="fixed">
+    <parent link="R_index_intermediate"/>
+    <child link="R_index_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00412053 0.0433132 -0.00501047"/>
   </joint>
 
   <link name="R_middle_proximal">
@@ -1635,6 +1768,26 @@
     <mimic joint="R_middle_proximal_joint" multiplier="1" offset="0"/>
   </joint>
 
+  <link name="R_middle_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="R_middle_tip_joint" type="fixed">
+    <parent link="R_middle_intermediate"/>
+    <child link="R_middle_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00426879 0.0466043 -0.00498678"/>
+  </joint>
+
+
   <link name="R_ring_proximal">
     <inertial>
       <origin xyz="0.001297 0.011934 -0.0060002" rpy="0 0 0"/>
@@ -1698,6 +1851,25 @@
     <mimic joint="R_ring_proximal_joint" multiplier="1" offset="0"/>
   </joint>
 
+  <link name="R_ring_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="R_ring_tip_joint" type="fixed">
+    <parent link="R_ring_intermediate"/>
+    <child link="R_ring_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00366554 0.0433541 -0.00501047"/>
+  </joint>
+
   <link name="R_pinky_proximal">
     <inertial>
       <origin xyz="0.001297 0.011934 -0.0060001" rpy="0 0 0"/>
@@ -1759,6 +1931,25 @@
     <axis xyz="0 0 1"/>
     <limit lower="0" upper="1.7" effort="1" velocity="0.5"/>
     <mimic joint="R_pinky_proximal_joint" multiplier="1" offset="0"/>
+  </joint>
+
+  <link name="R_pinky_tip">
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="R_pinky_tip_joint" type="fixed">
+    <parent link="R_pinky_intermediate"/>
+    <child link="R_pinky_tip"/>
+    <origin rpy="0 0 0" xyz="-0.00260734 0.0362776 -0.00501047"/>
   </joint>
 
 </robot>
