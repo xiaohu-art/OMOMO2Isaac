@@ -138,6 +138,7 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
                         robot_rotmat.detach().cpu().numpy()
                     ).as_quat(scalar_first=True),
         "joint_pos": robot_th.detach().cpu().numpy(),
+        "object": seq_data["object"],
     }
 
 def visualize_retarget(results: dict, seq_data: dict, chain: pk.Chain, fps: int = 30):
@@ -199,6 +200,9 @@ def main():
             print(f"Retargeting {seq_name} with {object_name}")
 
             results = run_retarget(chain, seq_data)
+
+            save_path = os.path.join(OUTPUT_PATH, f"{seq_name}_retargeted.pkl")
+            joblib.dump(results, save_path)
 
             if args.visualize:
                 visualize_retarget(results, seq_data, chain)
