@@ -111,7 +111,7 @@
                     <joint name="L_Wrist_x" type="hinge" pos="0 0 0" axis="1 0 0" stiffness="300" damping="30" armature="0.02" range="-180.0000 180.0000"/>
                     <joint name="L_Wrist_y" type="hinge" pos="0 0 0" axis="0 1 0" stiffness="300" damping="30" armature="0.02" range="-180.0000 180.0000"/>
                     <joint name="L_Wrist_z" type="hinge" pos="0 0 0" axis="0 0 1" stiffness="300" damping="30" armature="0.02" range="-180.0000 180.0000"/>
-                    <geom type="box" contype="1" conaffinity="1" density="2541.499616" pos="0.0456 -0.0061 -0.0030" size="0.0516 0.0062 0.0494" quat="1.0000 0.0000 0.0000 0.0000" name="L_Wrist"/>
+                    <geom type="box" contype="1" conaffinity="1" density="2541.499907" pos="0.0456 -0.0061 -0.0030" size="0.0516 0.0062 0.0494" quat="1.0000 0.0000 0.0000 0.0000" name="L_Wrist"/>
                     <body name="L_Index1" pos="0.1073 -0.0096 0.0213">
                       <joint name="L_Index1_x" type="hinge" pos="0 0 0" axis="1 0 0" stiffness="100" damping="10" armature="0.02" range="-180.0000 180.0000"/>
                       <joint name="L_Index1_y" type="hinge" pos="0 0 0" axis="0 1 0" stiffness="100" damping="10" armature="0.02" range="-180.0000 180.0000"/>
@@ -225,7 +225,7 @@
                     <joint name="R_Wrist_x" type="hinge" pos="0 0 0" axis="1 0 0" stiffness="300" damping="30" armature="0.02" range="-180.0000 180.0000"/>
                     <joint name="R_Wrist_y" type="hinge" pos="0 0 0" axis="0 1 0" stiffness="300" damping="30" armature="0.02" range="-180.0000 180.0000"/>
                     <joint name="R_Wrist_z" type="hinge" pos="0 0 0" axis="0 0 1" stiffness="300" damping="30" armature="0.02" range="-180.0000 180.0000"/>
-                    <geom type="box" contype="1" conaffinity="1" density="2541.49986" pos="-0.0454 -0.0079 -0.0037" size="0.0531 0.0063 0.0494" quat="1.0000 0.0000 0.0000 0.0000" name="R_Wrist"/>
+                    <geom type="box" contype="1" conaffinity="1" density="2541.500138" pos="-0.0454 -0.0079 -0.0037" size="0.0531 0.0063 0.0494" quat="1.0000 0.0000 0.0000 0.0000" name="R_Wrist"/>
                     <body name="R_Index1" pos="-0.1068 -0.0131 0.02">
                       <joint name="R_Index1_x" type="hinge" pos="0 0 0" axis="1 0 0" stiffness="100" damping="10" armature="0.02" range="-180.0000 180.0000"/>
                       <joint name="R_Index1_y" type="hinge" pos="0 0 0" axis="0 1 0" stiffness="100" damping="10" armature="0.02" range="-180.0000 180.0000"/>

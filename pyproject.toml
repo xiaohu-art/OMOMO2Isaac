@@ -8,6 +8,7 @@ dependencies = [
     "human-body-prior",
     "joblib>=1.5.3",
     "mujoco>=3.4.0",
+    "numpy<2.0",
     "pyrootutils>=1.0.4",
     "pytorch-kinematics>=0.7.6",
     "smpl-sim",

@@ -78,7 +78,15 @@ def quat_from_matrix(matrix: np.ndarray) -> np.ndarray:
         raise ValueError(f"Invalid rotation matrix shape {matrix.shape}.")
 
     batch_dim = matrix.shape[:-2]
-    m00, m01, m02, m10, m11, m12, m20, m21, m22 = np.unstack(matrix.reshape(batch_dim + (9,)), axis=-1)
+    m00 = matrix[..., 0, 0]
+    m01 = matrix[..., 0, 1]
+    m02 = matrix[..., 0, 2]
+    m10 = matrix[..., 1, 0]
+    m11 = matrix[..., 1, 1]
+    m12 = matrix[..., 1, 2]
+    m20 = matrix[..., 2, 0]
+    m21 = matrix[..., 2, 1]
+    m22 = matrix[..., 2, 2]
 
     q_abs = _sqrt_positive_part(
         np.stack(
@@ -126,7 +134,11 @@ def matrix_from_quat(quaternions: np.ndarray) -> np.ndarray:
     Reference:
         https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/transforms/rotation_conversions.py#L41-L70
     """
-    r, i, j, k = np.unstack(quaternions, axis=-1)
+    # r, i, j, k = np.unstack(quaternions, axis=-1)
+    r = quaternions[..., 0]
+    i = quaternions[..., 1]
+    j = quaternions[..., 2]
+    k = quaternions[..., 3]
     two_s = 2.0 / (quaternions * quaternions).sum(axis=-1)
 
     o = np.stack(
