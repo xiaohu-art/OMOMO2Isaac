@@ -6,6 +6,7 @@ import trimesh
 import yourdfpy
 import numpy as np
 import pytorch_kinematics as pk
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from scipy.spatial.transform import Rotation as sRot
 
@@ -42,12 +43,28 @@ JOINT_MAP = {
     "R_hand_base_link": "R_Wrist"
 }
 
-END_EFFECTOR_WEIGHTS = {
-    "L_hand_base_link": 5.0,
-    "R_hand_base_link": 5.0,
-    "left_ankle_roll_link": 5.0,
-    "right_ankle_roll_link": 5.0,
-}
+
+def parse_joint_limits(urdf_path: str, joint_names: list) -> tuple:
+    """Parse joint limits from URDF, returning (lower, upper) tensors ordered by joint_names."""
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    limits = {}
+    for joint_el in root.findall('joint'):
+        limit_el = joint_el.find('limit')
+        if limit_el is not None:
+            limits[joint_el.get('name')] = (
+                float(limit_el.get('lower', 0)),
+                float(limit_el.get('upper', 0)),
+            )
+    lower = torch.tensor([limits[n][0] for n in joint_names], dtype=torch.float32, device=DEVICE)
+    upper = torch.tensor([limits[n][1] for n in joint_names], dtype=torch.float32, device=DEVICE)
+    return lower, upper
+
+def joint_limit_loss(th: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
+    """Penalize joint angles outside [lower, upper]. th shape: (T, N_joints)."""
+    below = torch.clamp(lower - th, min=0)
+    above = torch.clamp(th - upper, min=0)
+    return torch.mean(below ** 2 + above ** 2)
 
 def build_chain(urdf_path: str) -> pk.Chain:
     with open(urdf_path, 'r') as f:
@@ -58,16 +75,6 @@ def build_chain(urdf_path: str) -> pk.Chain:
 
 def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
     keypoints = torch.tensor(seq_data["human"]["keypoints"], dtype=torch.float32, device=DEVICE)
-
-    """
-    Adjust ankle height due to morphology gap
-    """
-    ANKLE_OFFSET_Z = 0.2
-    l_ankle_idx = SMPLH_BONE_ORDER_NAMES.index("L_Ankle")
-    r_ankle_idx = SMPLH_BONE_ORDER_NAMES.index("R_Ankle")
-    keypoints[:, l_ankle_idx, 2] -= ANKLE_OFFSET_Z
-    keypoints[:, r_ankle_idx, 2] -= ANKLE_OFFSET_Z
-
     T = keypoints.shape[0]
 
     trans = seq_data["human"]["trans"]
@@ -83,19 +90,16 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
     smpl_indices = [SMPLH_BONE_ORDER_NAMES.index(n) for n in smpl_joint_names]
     smpl_keypoints = keypoints[:, smpl_indices, :]
 
-    weights = torch.tensor(
-        [END_EFFECTOR_WEIGHTS.get(name, 1.0) for name in robot_link_names], 
-        dtype=torch.float32, 
-        device=DEVICE
-    ).view(1, -1, 1)
+    # Parse joint limits from URDF
+    joint_names = chain.get_joint_parameter_names()
+    joint_lower, joint_upper = parse_joint_limits(G1_URDF_PATH, joint_names)
 
     # Initialize optimization variables
     robot_th = torch.nn.Parameter(torch.zeros(T, chain.n_joints).to(DEVICE))
     robot_trans = torch.nn.Parameter(torch.from_numpy(trans).float().to(DEVICE))
-    opt = torch.optim.Adam([robot_th, robot_trans], lr=0.02)
-    
+
     indices = chain.get_all_frame_indices()
-    
+
     def stack_positions(body_pos, names):
         return torch.stack(
             [body_pos[name].get_matrix()[:, :3, 3] for name in names], dim=1
@@ -110,27 +114,105 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         local = stack_positions(body_pos, robot_link_names)
         return to_world(local, trans, rotmat)
 
+    # ---- Stage 1: Normal IK, no ground correction ----
+    opt = torch.optim.Adam([robot_th, robot_trans], lr=0.02)
     for i in range(300):
         opt.zero_grad()
 
         robot_kp_w = get_robot_keypoints(robot_th, robot_trans, robot_rotmat)
         omega = torch.gradient(robot_th, spacing=1.0 / fps, dim=0)[0]
-        
-        keypoints_pos_error = torch.mean((robot_kp_w - smpl_keypoints) ** 2 * weights)
+
+        keypoints_pos_error = torch.mean((robot_kp_w - smpl_keypoints) ** 2)
         joint_pos_reg = torch.mean(torch.square(robot_th))
         joint_vel_reg = torch.mean(torch.square(omega))
-        loss = keypoints_pos_error + 1e-2 * joint_pos_reg + 1e-3 * joint_vel_reg
+        jl_loss = joint_limit_loss(robot_th, joint_lower, joint_upper)
+        loss = keypoints_pos_error + 2e-2 * joint_pos_reg + 1e-3 * joint_vel_reg + 10.0 * jl_loss
 
         loss.backward()
         opt.step()
 
         if i % 50 == 0:
             print(
-                f"iter {i}, loss {loss.item():.6f}, "
+                f"[Stage1] iter {i}, loss {loss.item():.6f}, "
                 f"kp {keypoints_pos_error.item():.6f}, "
                 f"j_pos {joint_pos_reg.item():.6f}, "
                 f"j_vel {joint_vel_reg.item():.6f}, "
+                f"j_lim {jl_loss.item():.6f}, "
             )
+
+    # ---- Stage 2: Freeze lower body, optimize root Z + upper body for ground alignment ----
+    G1_ANKLE_TO_SOLE = 0.035  # collision spheres at z=-0.03, radius=0.005
+    LOWER_BODY_JOINTS = 12  # indices 0-11: hip/knee/ankle joints
+    l_hand_idx = robot_link_names.index("L_hand_base_link")
+    r_hand_idx = robot_link_names.index("R_hand_base_link")
+    l_ankle_robot_idx = robot_link_names.index("left_ankle_roll_link")
+    r_ankle_robot_idx = robot_link_names.index("right_ankle_roll_link")
+
+    # Detect ground contact frames from SMPLX toe keypoints (ground = Z=0)
+    GROUND_THRESH = 0.08
+    l_toe_smpl_idx = SMPLH_BONE_ORDER_NAMES.index("L_Toe")
+    r_toe_smpl_idx = SMPLH_BONE_ORDER_NAMES.index("R_Toe")
+    l_contact = (keypoints[:, l_toe_smpl_idx, 2] < GROUND_THRESH).float()  # (T,)
+    r_contact = (keypoints[:, r_toe_smpl_idx, 2] < GROUND_THRESH).float()  # (T,)
+
+    # Record hand positions from stage 1 as targets
+    with torch.no_grad():
+        stage1_kp = get_robot_keypoints(robot_th, robot_trans, robot_rotmat)
+        ee_targets = stage1_kp.detach().clone()
+
+    # Split joint parameters: freeze lower body, optimize upper body
+    lower_th = robot_th.data[:, :LOWER_BODY_JOINTS].detach().clone()  # frozen
+    upper_th = torch.nn.Parameter(robot_th.data[:, LOWER_BODY_JOINTS:].detach().clone())
+    root_z_offset = torch.nn.Parameter(torch.zeros(T, 1, device=DEVICE))
+    opt2 = torch.optim.Adam([upper_th, root_z_offset], lr=0.01)
+
+    for i in range(200):
+        opt2.zero_grad()
+
+        # Reassemble full joint angles: frozen lower + optimized upper
+        full_th = torch.cat([lower_th, upper_th], dim=1)
+
+        # Apply Z offset to root translation
+        adjusted_trans = robot_trans.detach().clone()
+        adjusted_trans[:, 2:3] += root_z_offset
+
+        robot_kp_w = get_robot_keypoints(full_th, adjusted_trans, robot_rotmat)
+
+        # End-effector preservation: hands stay at stage 1 positions
+        ee_loss = torch.mean((robot_kp_w[:, l_hand_idx, :] - ee_targets[:, l_hand_idx, :]) ** 2) \
+                + torch.mean((robot_kp_w[:, r_hand_idx, :] - ee_targets[:, r_hand_idx, :]) ** 2)
+
+        # Ground alignment: only when SMPLX foot is in ground contact
+        l_sole_z = robot_kp_w[:, l_ankle_robot_idx, 2] - G1_ANKLE_TO_SOLE
+        r_sole_z = robot_kp_w[:, r_ankle_robot_idx, 2] - G1_ANKLE_TO_SOLE
+        ground_loss = torch.mean(l_contact * l_sole_z ** 2) \
+                    + torch.mean(r_contact * r_sole_z ** 2)
+
+        omega = torch.gradient(upper_th, spacing=1.0 / fps, dim=0)[0]
+        joint_pos_reg = torch.mean(torch.square(upper_th))
+        joint_vel_reg = torch.mean(torch.square(omega))
+        jl_loss = joint_limit_loss(upper_th, joint_lower[LOWER_BODY_JOINTS:], joint_upper[LOWER_BODY_JOINTS:])
+
+        loss = 10.0 * ee_loss + 5.0 * ground_loss \
+             + 2e-2 * joint_pos_reg + 1e-3 * joint_vel_reg + 10.0 * jl_loss
+
+        loss.backward()
+        opt2.step()
+
+        if i % 50 == 0:
+            print(
+                f"[Stage2] iter {i}, loss {loss.item():.6f}, "
+                f"ee {ee_loss.item():.6f}, "
+                f"ground {ground_loss.item():.6f}, "
+                f"j_pos {joint_pos_reg.item():.6f}, "
+                f"j_vel {joint_vel_reg.item():.6f}, "
+                f"j_lim {jl_loss.item():.6f}, "
+            )
+
+    # Merge results back
+    with torch.no_grad():
+        robot_th.data = torch.cat([lower_th, upper_th.data], dim=1)
+        robot_trans.data[:, 2:3] += root_z_offset.data
 
     return {
         "root_trans": robot_trans.detach().cpu().numpy(),
