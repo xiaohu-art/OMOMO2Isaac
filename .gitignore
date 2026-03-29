@@ -212,3 +212,7 @@ data/
 
 # Models
 models/
+
+# Claude
+.claude/
+CLAUDE.md
