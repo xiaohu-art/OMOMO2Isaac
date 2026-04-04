@@ -15,6 +15,7 @@ import yourdfpy
 import numpy as np
 import pytorch_kinematics as pk
 import xml.etree.ElementTree as ET
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as sRot
 
 import pyrootutils
@@ -150,10 +151,78 @@ def to_world(pos_local, trans, rotmat):
     return pos_w.squeeze(-1) + trans.unsqueeze(1)
 
 
+def compute_contact_labels(
+    chain: pk.Chain,
+    robot_th: torch.Tensor,
+    robot_trans: torch.Tensor,
+    robot_rotmat: torch.Tensor,
+    obj_verts_world: np.ndarray,
+    close_thresh: float = 0.05,
+    far_thresh: float = 0.20,
+):
+    """Compute per-link contact labels and distances using cKDTree.
+
+    Args:
+        chain: Robot kinematic chain.
+        robot_th: (T, n_joints) joint angles.
+        robot_trans: (T, 3) root translation.
+        robot_rotmat: (T, 3, 3) root rotation matrices.
+        obj_verts_world: (T, V, 3) object vertices in world frame.
+        close_thresh: Distance below which a link is "in contact" (label=1).
+        far_thresh: Distance above which a link is "no contact" (label=-1).
+
+    Returns:
+        contact_label: (T, n_links) float array — 1.0 / 0.0 / -1.0
+        contact_distance: (T, n_links) float array — min distance per link
+        link_names: list of link names corresponding to columns
+    """
+    T = robot_th.shape[0]
+    indices = chain.get_all_frame_indices()
+    body_pos = chain.forward_kinematics(robot_th, indices)
+    link_names = sorted(body_pos.keys())
+    n_links = len(link_names)
+
+    # Stack all link positions → (T, n_links, 3) in local frame, then to world
+    local_pos = torch.stack([body_pos[n].get_matrix()[:, :3, 3] for n in link_names], dim=1)
+    world_pos = to_world(local_pos, robot_trans, robot_rotmat).detach().cpu().numpy()  # (T, n_links, 3)
+
+    contact_distance = np.zeros((T, n_links), dtype=np.float32)
+    contact_label = np.zeros((T, n_links), dtype=np.float32)
+
+    for t in range(T):
+        tree = cKDTree(obj_verts_world[t])
+        dists, _ = tree.query(world_pos[t])  # (n_links,)
+        contact_distance[t] = dists
+        contact_label[t, dists < close_thresh] = 1.0
+        contact_label[t, dists > far_thresh] = -1.0
+
+    n_contact_frames = np.sum(np.any(contact_label > 0, axis=1))
+    print(f"  Contact labels: {n_links} links, {n_contact_frames}/{T} frames with contact")
+
+    return contact_label, contact_distance, link_names
+
 
 # =============================================================================
 # Three-stage retargeting
 # =============================================================================
+
+def load_object_mesh(seq_data: dict):
+    """Load object mesh and precompute world-space vertices for each frame.
+
+    Returns:
+        obj_verts_world: (T, V, 3) ndarray of object vertices in world coordinates.
+        obj_verts_rest: (V, 3) ndarray of rest-pose vertices.
+    """
+    obj = seq_data["object"]
+    obj_name = str(obj["name"])
+    mesh = trimesh.load(os.path.join(OBJECTS_PATH, f"{obj_name}.obj"), force="mesh")
+    obj_verts = np.asarray(mesh.vertices, dtype=np.float32)  # (V, 3)
+    obj_rot = obj["rot"]    # (T, 3, 3)
+    obj_trans = obj["trans"]  # (T, 3)
+    # (V,3) @ (T,3,3)^T + (T,1,3) → (T,V,3)
+    obj_verts_world = np.einsum("vj,tij->tvi", obj_verts, obj_rot) + obj_trans[:, None, :]
+    return obj_verts_world, obj_verts
+
 
 def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
     keypoints = torch.tensor(seq_data["human"]["keypoints"], dtype=torch.float32, device=DEVICE)
@@ -166,6 +235,10 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         "xyz", [np.pi / 2, 0.0, np.pi / 2]
     ).inv()
     robot_rotmat = torch.tensor(robot_rot.as_matrix(), dtype=torch.float32, device=DEVICE)
+
+    # Load object mesh (world-space vertices per frame)
+    obj_verts_world, _ = load_object_mesh(seq_data)
+    print(f"Object mesh loaded: {obj_verts_world.shape[1]} vertices, {T} frames")
 
     # Body link targets
     robot_link_names = list(JOINT_MAP.keys())
@@ -392,6 +465,16 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         vals = {joint_names[j]: robot_th.data[0, j].item() for j in hand_indep[side]}
         print(f"  {side} frame 0: " + "  ".join(f"{k.split('_',1)[1][:12]}={v:.3f}" for k, v in vals.items()))
 
+    # =====================================================================
+    # Compute contact labels
+    # =====================================================================
+    print("=" * 60)
+    print("Computing contact labels")
+    print("=" * 60)
+    contact_label, contact_distance, link_names = compute_contact_labels(
+        chain, robot_th.data, robot_trans.data, robot_rotmat, obj_verts_world,
+    )
+
     return {
         "root_trans": robot_trans.detach().cpu().numpy(),
         "root_quat": sRot.from_matrix(
@@ -399,6 +482,9 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         ).as_quat(scalar_first=True),
         "joint_pos": robot_th.detach().cpu().numpy(),
         "object": seq_data["object"],
+        "contact_label": contact_label,
+        "contact_distance": contact_distance,
+        "link_names": link_names,
     }
 
 

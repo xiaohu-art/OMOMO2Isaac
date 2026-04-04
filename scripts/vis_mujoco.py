@@ -1,6 +1,7 @@
 import os
 import time
 import joblib
+import numpy as np
 import mujoco
 import mujoco.viewer
 from scipy.spatial.transform import Rotation as R
@@ -14,14 +15,19 @@ root = pyrootutils.setup_root(
 )
 
 from utils.cli_args import (
-    parse_args, 
-    OUTPUT_PATH, 
+    parse_args,
+    OUTPUT_PATH,
     SMPLX_ROBOTS_PATH, OBJECTS_PATH,
-    SMPLH_BONE_ORDER_NAMES, 
+    SMPLH_BONE_ORDER_NAMES,
     MUJOCO_BONE_ORDER_NAMES
 )
 
 SMPLH2MJC = [SMPLH_BONE_ORDER_NAMES.index(name) for name in MUJOCO_BONE_ORDER_NAMES]
+
+# Contact label → geom color mapping
+COLOR_CONTACT = np.array([1.0, 0.2, 0.2, 1.0])   # red = in contact
+COLOR_NO_CONTACT = np.array([0.2, 0.2, 1.0, 1.0]) # blue = far / no contact
+COLOR_NEUTRAL = np.array([0.8, 0.8, 0.8, 1.0])    # grey = neutral / undefined
 
 def create_scene_xml(human_xml_path, obj_mesh_path, obj_name):
     with open(human_xml_path, 'r') as f:
@@ -91,6 +97,13 @@ def main():
 
         num_frames = trans.shape[0]
 
+        # Contact labels: (T, 52) in SMPLH order → remap to MuJoCo geom indices
+        contacts_mjc = human_data["contacts"][:, SMPLH2MJC]  # (T, 52)
+        contact_geom_map = {
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name): i
+            for i, name in enumerate(MUJOCO_BONE_ORDER_NAMES)
+        }
+
         def key_callback(keycode):
             nonlocal current_idx, reload
             
@@ -118,8 +131,19 @@ def main():
                 data.mocap_quat[obj_mocap_id] = R.from_matrix(obj_rot[frame]).as_quat(scalar_first=True)
 
                 mujoco.mj_forward(model, data)
+
+                # Color bodies by contact label
+                for gid, col_idx in contact_geom_map.items():
+                    label = contacts_mjc[frame, col_idx]
+                    if label > 0:
+                        model.geom_rgba[gid] = COLOR_CONTACT
+                    elif label < 0:
+                        model.geom_rgba[gid] = COLOR_NO_CONTACT
+                    else:
+                        model.geom_rgba[gid] = COLOR_NEUTRAL
+
                 viewer.sync()
-                
+
                 frame = (frame + 1) % num_frames
                 time.sleep(1 / 30)
 
