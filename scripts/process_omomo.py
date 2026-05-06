@@ -1,6 +1,8 @@
 import os
+import gc
 import joblib
 import numpy as np
+import torch
 from tqdm import tqdm
 from human_body_prior.body_model.body_model import BodyModel
 
@@ -123,22 +125,28 @@ def main():
     print("Loading SMPL models...")
     smpl_models = load_smpl_models(SMPLX_PATH)
 
-    all_sequences = {}
+    output_root = os.path.join(OUTPUT_PATH, f'{args.flag}_sequences')
+    os.makedirs(output_root, exist_ok=True)
 
     keys = list(data_dict.keys())
     pbar = tqdm(keys)
-    
+
     for index in pbar:
         seq_entry = data_dict[index]
         seq_name = seq_entry['seq_name']
         subject_name = seq_name.split("_")[0]
         object_name = seq_name.split("_")[1]
-        
+
         pbar.set_description(f"Processing {seq_name}")
 
         if object_name in ["mop", "vacuum"]:
             continue
-        
+
+        out_dir = os.path.join(output_root, object_name)
+        out_file = os.path.join(out_dir, f"{seq_name}.pkl")
+        if os.path.exists(out_file):
+            continue
+
         gender = str(seq_entry['gender'])
         betas = seq_entry['betas'][0]
 
@@ -147,14 +155,14 @@ def main():
             generate_subject_xml(betas, gender, xml_filename)
 
         new_poses, new_trans, new_obj_rot, new_obj_trans = canonicalize_sequence(seq_entry, gender)
-        
+
         human_input = {
             'poses': new_poses,
             'betas': betas,
             'trans': new_trans,
             'gender': gender,
         }
-        
+
         obj_scale = seq_entry['obj_scale'].mean()
         object_input = {
             'rot': new_obj_rot,
@@ -164,26 +172,26 @@ def main():
         }
 
         processed_human, processed_obj = process_single_sequence(
-            human_input, 
-            object_input, 
+            human_input,
+            object_input,
             smpl_models[gender],
             visualize=args.visualize
         )
 
-        if object_name not in all_sequences:
-            all_sequences[object_name] = {}
-        
-        all_sequences[object_name][seq_name] = {
-            'human': processed_human,
-            'object': processed_obj,
-        }
+        os.makedirs(out_dir, exist_ok=True)
+        joblib.dump(
+            {'human': processed_human, 'object': processed_obj},
+            out_file,
+        )
 
-        break
+        del processed_human, processed_obj
+        del new_poses, new_trans, new_obj_rot, new_obj_trans
+        del human_input, object_input
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    output_file = os.path.join(OUTPUT_PATH, f'{args.flag}_sequences.pkl')
-    print(f"Saving {len(all_sequences)} object categories to {output_file}")
-    joblib.dump(all_sequences, output_file)
+    print(f"Done. Per-sequence files written under {output_root}")
 
 if __name__ == "__main__":
     main()

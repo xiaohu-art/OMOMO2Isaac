@@ -2,6 +2,7 @@ import os
 import torch
 import trimesh
 import numpy as np
+from scipy.spatial import cKDTree
 
 from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
 
@@ -102,12 +103,19 @@ def process_single_sequence(human_data, object_data, smpl_model, visualize=False
     mesh_obj = trimesh.load(obj_mesh_path, force='mesh')
     obj_verts, obj_faces = mesh_obj.vertices, mesh_obj.faces
     frame_times = poses.shape[0]
+
+    target_verts = 2048
+    target_faces = max(int(len(obj_faces) * target_verts / len(obj_verts)), 4)
+    mesh_lite = mesh_obj.simplify_quadric_decimation(face_count=target_faces)
+    opt_verts = np.asarray(mesh_lite.vertices)
+    opt_faces = np.asarray(mesh_lite.faces)
     
+
     smpl_model.to(DEVICE)
     optimized_hand_pose = optimize_hand(
-        frame_times, poses, betas, trans, smpl_model, 
-        obj_rot, obj_trans, obj_verts, obj_faces,
-        epochs=1000, lr=0.001
+        frame_times, poses, betas, trans, smpl_model,
+        obj_rot, obj_trans, opt_verts, opt_faces,
+        epochs=500, lr=0.001
     )
 
     smpl_model.to('cpu')
@@ -141,9 +149,14 @@ def process_single_sequence(human_data, object_data, smpl_model, visualize=False
     keypoints[:, :, 2] -= min_z
     obj_verts_world[:, :, 2] -= min_z
 
-    # Compute contacts based on distance and relative velocity
-    dist_matrix = np.linalg.norm(keypoints[:, None, :, :] - obj_verts_world[:, :, None, :], axis=-1)
-    distance = dist_matrix.min(axis=1)  # [T, K] - minimum distance from each keypoint to object
+    # Per-frame KDTree query for min distance from each keypoint to the object surface.
+    # Avoids the [T, N, K, 3] broadcast that previously blew memory on long sequences.
+    T_frames, K = keypoints.shape[0], keypoints.shape[1]
+    distance = np.empty((T_frames, K), dtype=np.float32)
+    for t in range(T_frames):
+        tree = cKDTree(obj_verts_world[t])
+        d, _ = tree.query(keypoints[t], k=1)
+        distance[t] = d
 
     contacts = np.zeros_like(distance, dtype=np.float32)
     contacts[distance < 0.05] = 1.0

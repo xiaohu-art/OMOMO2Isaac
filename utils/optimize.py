@@ -201,8 +201,14 @@ class HandOptimizer:
         
         init_pose = torch.cat([l_mean, r_mean], dim=1) # [T, 30, 3] (15 joints * 2 hands)
         self.hand_pose_param = init_pose.clone().detach().requires_grad_(True)
-        
+
         self.optimizer = optim.Adam([self.hand_pose_param], lr=HandConfig.LR)
+
+        # Cache per-hand constants (reused every epoch in `_compute_single_hand_loss`).
+        self._l_flip = torch.tensor([-1.0, -1.0, 1.0], device=self.device)
+        self._r_flip = torch.tensor([1.0, 1.0, 1.0], device=self.device)
+        self._l_mean_target = torch.from_numpy(self.res.l_mean).float().to(self.device).reshape(15, 3)
+        self._r_mean_target = torch.from_numpy(self.res.r_mean).float().to(self.device).reshape(15, 3)
 
     def _prepare_object(self, obj_data):
         """Prepare object vertices and normals in world space"""
@@ -219,7 +225,17 @@ class HandOptimizer:
         # 1. Calculate Initial Contact Masks (Pre-optimization)
         with torch.no_grad():
             masks = self._compute_contact_masks(self.hand_pose_param)
-        
+
+        # Pre-compute active-frame indices: only frames flagged in w_opt produce
+        # non-zero SDF/region loss, so we can restrict cdist + region work to them.
+        for side in ('left', 'right'):
+            opt_flat = masks[side]['opt'].squeeze(-1)
+            active_idx = (opt_flat > 0).nonzero(as_tuple=False).squeeze(-1)
+            masks[side]['active_idx'] = active_idx
+            masks[side]['linear_active'] = masks[side]['linear'].index_select(0, active_idx)
+            # (1 - w_linear) reshaped for broadcast over h_params (T, 15, 3) — frozen, used by mean-pose regularizer.
+            masks[side]['one_minus_lin'] = (1.0 - masks[side]['linear']).unsqueeze(-1)
+
         # 2. Optimization Loop
         pbar = tqdm(range(epochs), desc="Optimizing Hand")
         for epoch in pbar:
@@ -285,68 +301,59 @@ class HandOptimizer:
 
     def _compute_single_hand_loss(self, smpl_out, is_right, masks, epoch):
         """Calculate all loss components for one hand"""
-        # Select resources
+        # Select resources (cached on self at __init__ — not re-allocated per epoch)
         if is_right:
             indices_det = self.res.r_idx_det
             small_indices = self.res.r_small_idx
             smpl_idx = self.res.r_smplx_idx
             param_offset = 15 # Right hand is the second half (indices 15-30)
-            euler_flip = torch.tensor([1.0, 1.0, 1.0]).to(self.device)
-            mean_target = torch.from_numpy(self.res.r_mean).to(self.device).reshape(15, 3)
+            euler_flip = self._r_flip
+            mean_target = self._r_mean_target
         else:
             indices_det = self.res.l_idx_det
             small_indices = self.res.l_small_idx
             smpl_idx = self.res.l_smplx_idx
             param_offset = 0  # Left hand is the first half (indices 0-15)
-            euler_flip = torch.tensor([-1.0, -1.0, 1.0]).to(self.device)
-            mean_target = torch.from_numpy(self.res.l_mean).to(self.device).reshape(15, 3)
+            euler_flip = self._l_flip
+            mean_target = self._l_mean_target
 
         # Extract hand data
-        h_verts = smpl_out.v[:, smpl_idx]
-        h_params = self.hand_pose_param[:, param_offset:param_offset+15, :] # [T, 15, 3]
+        h_verts = smpl_out.v[:, smpl_idx]                                        # (T, 170, 3) — full T, used by smoothness
+        h_params = self.hand_pose_param[:, param_offset:param_offset+15, :]      # (T, 15, 3)
 
         # Weights
-        w_touch_lin = masks['linear']
-        
-        # 1. SDF Calculation
-        _, signed_dist, _, = point2point_signed(h_verts, self.obj_verts_world, self.obj_normals_world)
-        
+        w_touch_lin = masks['linear']                                            # (T, 1) — used by mean-pose / prior on full T
+        active_idx = masks['active_idx']                                         # int (T_active,)
+        w_lin_active = masks['linear_active']                                    # (T_active, 1)
+
         loss_coll = torch.tensor(0.0, device=self.device)
         loss_attr = torch.tensor(0.0, device=self.device)
 
-        # 2. Region-based Collision & Attraction
-        for i in range(len(indices_det)):
-            # Collision: Punish penetration
-            sd_region = signed_dist[:, indices_det[i]]
-            
-            # Penetration mask: dist < 0
-            mask_pen = (sd_region < 0)
-            
-            # Only punish if frame needs optimization
-            # Logic borrowed from original: if any vertex penetrates in frame
-            mask_frame_pen = mask_pen.any(dim=-1)
-            
-            if mask_frame_pen.any():
-                pen_vals = sd_region[mask_frame_pen]
-                # Filter noise
-                valid_pen = (pen_vals < 0) & (pen_vals.abs() < HandConfig.PENETRATION_LIMIT)
-                
-                # Weight by contact probability
-                frame_weights = w_touch_lin[mask_frame_pen]
-                
-                # Mean per penetrating vertex, then sum
-                num_pen = valid_pen.float().sum(dim=-1, keepdim=True).clamp(min=1.0)
-                loss_coll += torch.sum(pen_vals.abs() * valid_pen.float() * frame_weights / num_pen) * 2.0
+        # 1+2. SDF + Region losses, restricted to active frames (rest contribute 0).
+        if active_idx.numel() > 0:
+            h_verts_a = h_verts.index_select(0, active_idx)
+            obj_v_a = self.obj_verts_world.index_select(0, active_idx)
+            obj_n_a = self.obj_normals_world.index_select(0, active_idx)
 
-            # Attraction: Pull "clean" frames closer
-            # Original logic: If NO penetration in frame, pull specific points (small_indices) to surface
-            mask_clean = ~mask_frame_pen
-            if mask_clean.any():
-                sd_clean = signed_dist[mask_clean][:, small_indices[i]]
-                clean_weights = w_touch_lin[mask_clean]
-                # loss_attr += 5.0 * torch.sum((sd_clean.abs() ** 2) * clean_weights) # Apply weight? 
-                # Original code multiplied SDF by w_touch_l before slicing.
-                loss_attr += 5.0 * torch.sum((sd_clean * clean_weights).abs()**2)
+            _, signed_dist, _ = point2point_signed(h_verts_a, obj_v_a, obj_n_a) # (T_a, 170)
+
+            for i in range(len(indices_det)):
+                sd_region = signed_dist[:, indices_det[i]]                       # (T_a, V_region)
+                mask_pen = sd_region < 0
+
+                pen_frame = mask_pen.any(dim=-1, keepdim=True).float()           # (T_a, 1)
+                clean_frame = 1.0 - pen_frame
+
+                valid_pen_f = (mask_pen & (sd_region.abs() < HandConfig.PENETRATION_LIMIT)).float()
+                num_pen = valid_pen_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                loss_coll = loss_coll + 2.0 * torch.sum(
+                    sd_region.abs() * valid_pen_f * w_lin_active * pen_frame / num_pen
+                )
+
+                sd_clean = signed_dist[:, small_indices[i]]                      # (T_a, V_small)
+                loss_attr = loss_attr + 5.0 * torch.sum(
+                    (sd_clean * w_lin_active).pow(2) * clean_frame
+                )
 
         # 3. Range of Motion (ROM)
         # Flip Euler angles for left hand to match right-hand constraints
@@ -367,8 +374,8 @@ class HandOptimizer:
             loss_reg += smooth_loss(h_params, h_verts) * 0.5
             
             # Regress to Mean Pose (when not touching)
-            # h_params: [T, 15, 3], mean_target: [15, 3], w_touch_lin: [T, 1]
-            loss_reg += 0.05 * torch.sum((h_params - mean_target.unsqueeze(0))**2 * (1.0 - w_touch_lin).unsqueeze(-1))
+            # h_params: [T, 15, 3], mean_target: [15, 3], one_minus_lin: [T, 1, 1] (cached)
+            loss_reg += 0.05 * torch.sum((h_params - mean_target.unsqueeze(0))**2 * masks['one_minus_lin'])
             
         # 5. Prior Model (VPoser/GrabPrior)
         if epoch > 200:

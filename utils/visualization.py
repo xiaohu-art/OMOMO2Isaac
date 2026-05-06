@@ -41,7 +41,6 @@ def visualize_with_viser(
         points=keypoints[0],
         colors=initial_colors,
         point_size=0.02,
-        opacity=1.0
     )
 
     t = 0

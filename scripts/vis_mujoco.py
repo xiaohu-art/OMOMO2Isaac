@@ -51,8 +51,7 @@ def create_scene_xml(human_xml_path, obj_mesh_path, obj_name):
 def main():
     args = parse_args()
 
-    # sequences_path = os.path.join(OUTPUT_PATH, f'{args.flag}_sequences.pkl')
-    sequences_path = os.path.join(OUTPUT_PATH, 'example.pkl')
+    sequences_path = os.path.join(OUTPUT_PATH, f'{args.flag}_sequences.pkl')
     sequences = joblib.load(sequences_path)
 
     playlist = []

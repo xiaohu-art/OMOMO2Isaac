@@ -744,22 +744,47 @@ def main():
     args = parse_args()
     chain = build_chain(G1_URDF_PATH)
 
-    sequences_path = os.path.join(OUTPUT_PATH, 'example.pkl')
+    sequences_path = os.path.join(OUTPUT_PATH, f'{args.flag}_sequences.pkl')
     sequences = joblib.load(sequences_path)
+
+    retarget_root = os.path.join(OUTPUT_PATH, f'{args.flag}_retargeted')
+    os.makedirs(retarget_root, exist_ok=True)
 
     for object_name, object_seqs in sequences.items():
         for seq_name, seq_data in object_seqs.items():
+            out_dir = os.path.join(retarget_root, object_name)
+            out_file = os.path.join(out_dir, f"{seq_name}.pkl")
+            if os.path.exists(out_file):
+                continue
+
             print(f"\nRetargeting {seq_name} with {object_name}")
             print("=" * 60)
 
             results = run_retarget(chain, seq_data)
 
-            save_path = os.path.join(OUTPUT_PATH, f"{seq_name}_retargeted.pkl")
-            joblib.dump(results, save_path)
-            print(f"\nSaved to {save_path}")
+            os.makedirs(out_dir, exist_ok=True)
+            joblib.dump(results, out_file)
+            print(f"\nSaved to {out_file}")
 
             if args.visualize:
                 visualize_retarget(results, seq_data, chain)
+
+    merged = {}
+    for object_name in sorted(os.listdir(retarget_root)):
+        obj_dir = os.path.join(retarget_root, object_name)
+        if not os.path.isdir(obj_dir):
+            continue
+        merged[object_name] = {}
+        for fname in sorted(os.listdir(obj_dir)):
+            if not fname.endswith('.pkl'):
+                continue
+            seq_name = os.path.splitext(fname)[0]
+            merged[object_name][seq_name] = joblib.load(os.path.join(obj_dir, fname))
+
+    merged_path = os.path.join(OUTPUT_PATH, f'{args.flag}_retargeted.pkl')
+    joblib.dump(merged, merged_path)
+    total = sum(len(v) for v in merged.values())
+    print(f"\nMerged {total} retargeted sequences across {len(merged)} objects -> {merged_path}")
 
 if __name__ == "__main__":
     main()

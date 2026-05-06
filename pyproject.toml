@@ -5,6 +5,7 @@ description = "Pipeline to process OMOMO dataset, generate corresponding smplx r
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fast-simplification>=0.1.13",
     "human-body-prior",
     "imageio-ffmpeg>=0.6.0",
     "joblib>=1.5.3",
