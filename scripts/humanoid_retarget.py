@@ -57,27 +57,11 @@ IK_TARGETS = {
     "right_shoulder_yaw_link": IKEntry("R_Shoulder",   0, 10, ( 0.0, 0.70710678, 0.0, 0.70710678)),
     "right_elbow_link":        IKEntry("R_Elbow",      0, 10, ( 0.0, 0.0, 0.0, -1.0)),
     # -- HOI wrist anchor: rot_offset = gmr(wrist_yaw) ⊗ R(wrist_yaw -> hand_base) --
-    "L_hand_base_link":        IKEntry("L_Wrist",    100, 10, ( 0.70710678,  0.0,         0.0,         0.70710678)),
-    "R_hand_base_link":        IKEntry("R_Wrist",    100, 10, ( 0.0,        -0.70710678, -0.70710678,  0.0)),
+    # "L_hand_base_link":        IKEntry("L_Wrist",    100, 10, ( 0.70710678,  0.0,         0.0,         0.70710678)),
+    # "R_hand_base_link":        IKEntry("R_Wrist",    100, 10, ( 0.0,        -0.70710678, -0.70710678,  0.0)),
     # Alternative (ablation): anchor wrist_yaw_link instead of hand_base_link.
-    # "left_wrist_yaw_link":   IKEntry("L_Wrist",    100, 10, ( 1.0, 0.0, 0.0, 0.0)),
-    # "right_wrist_yaw_link":  IKEntry("R_Wrist",    100, 10, ( 0.0, 0.0, 0.0, -1.0)),
-}
-
-# Hand fingertip link mapping: G1 tip link -> SMPLX fingertip joint
-HAND_TIP_MAP = {
-    "L": {
-        "tip_links": ["L_thumb_tip", "L_index_tip", "L_middle_tip", "L_ring_tip", "L_pinky_tip"],
-        "smplx_tips": ["L_Thumb3", "L_Index3", "L_Middle3", "L_Ring3", "L_Pinky3"],
-        "wrist_link": "L_hand_base_link",
-        "smplx_wrist": "L_Wrist",
-    },
-    "R": {
-        "tip_links": ["R_thumb_tip", "R_index_tip", "R_middle_tip", "R_ring_tip", "R_pinky_tip"],
-        "smplx_tips": ["R_Thumb3", "R_Index3", "R_Middle3", "R_Ring3", "R_Pinky3"],
-        "wrist_link": "R_hand_base_link",
-        "smplx_wrist": "R_Wrist",
-    },
+    "left_wrist_yaw_link":   IKEntry("L_Wrist",    100, 10, ( 1.0, 0.0, 0.0, 0.0)),
+    "right_wrist_yaw_link":  IKEntry("R_Wrist",    100, 10, ( 0.0, 0.0, 0.0, -1.0)),
 }
 
 
@@ -338,16 +322,6 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
     robot_trans = torch.nn.Parameter(torch.from_numpy(trans).float().to(DEVICE))
     indices = chain.get_all_frame_indices()
 
-    def stack_positions(body_pos, names):
-        return torch.stack(
-            [body_pos[name].get_matrix()[:, :3, 3] for name in names], dim=1
-        )
-
-    def get_body_keypoints(th, trans, rotmat):
-        body_pos = chain.forward_kinematics(th, indices)
-        local = stack_positions(body_pos, robot_link_names)
-        return to_world(local, trans, rotmat)
-
     # =====================================================================
     # Stage 1: Full body IK + ground contact
     # =====================================================================
@@ -418,6 +392,18 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
     print("Stage 2: Contact-aware hand refinement")
     print("=" * 60)
 
+    # Loss weights and optimizer config for the per-iter optimization.
+    W_ATTRACT, W_COLLIDE = 50.0, 500.0
+    W_JL, W_SMOOTH = 1000.0, 0.5
+    N_ITER, LR = 300, 0.005
+
+    # Warm-start hand joints at the midpoint of joint range
+    with torch.no_grad():
+        for side in ["L", "R"]:
+            for j_idx in hand_indep[side]:
+                robot_th.data[:, j_idx] = 0.5 * (joint_lower[j_idx] + joint_upper[j_idx])
+        robot_th.data.copy_(enforce_mimic(robot_th.data, mimic_map))
+
     # Build SMPLX contact mask: (T, 5) per side — True when any fingertip should contact
     smplx_contacts = seq_data["human"]["contacts"]  # (T, 52) in SMPLH order
     smplx_tip_indices = {
@@ -426,6 +412,7 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         "R": [SMPLH_BONE_ORDER_NAMES.index(n) for n in
               ["R_Thumb3", "R_Index3", "R_Middle3", "R_Ring3", "R_Pinky3"]],
     }
+    
     # Per-side: (T,) — True if ANY fingertip has contact in that frame
     contact_mask = {}
     for side in ["L", "R"]:
@@ -462,56 +449,51 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         # Indices of joints to optimize: arm (7) + independent finger (6) = 13
         opt_indices = arm_joint_indices[side] + hand_indep[side]
 
-        # Save Stage 1 values as prior targets
-        prior_values = robot_th.data[:, opt_indices].detach().clone()
-
-        # Create optimizable parameter for this side's joints
-        side_params = torch.nn.Parameter(robot_th.data[:, opt_indices].detach().clone())
-        opt4 = torch.optim.Adam([side_params], lr=0.005)
+        # Init from Stage 1 pose; no anchor prior — attract/collide drive the
+        # arm + finger configuration freely, only constrained by joint limits
+        # and temporal smoothness.
+        side_params = torch.nn.Parameter(
+            robot_th.data[:, opt_indices].detach().clone()
+        )
+        opt2 = torch.optim.Adam([side_params], lr=LR)
 
         mask = contact_mask[side]  # (T,)
+        contact_denom = mask.sum() * 5 + 1e-8
+
         tip_links = g1_tip_links[side]
+        tip_frame_indices = chain.get_frame_indices(*tip_links)
 
         # Precompute smoothed target positions from Stage 1 pose
         with torch.no_grad():
-            init_th = enforce_mimic(robot_th.data.clone(), mimic_map)
-            init_body = chain.forward_kinematics(init_th, indices)
+            init_th = enforce_mimic(robot_th.data, mimic_map)  # enforce_mimic clones internally
+            init_body = chain.forward_kinematics(init_th, tip_frame_indices)
             init_tip_local = torch.stack(
                 [init_body[n].get_matrix()[:, :3, 3] for n in tip_links], dim=1,
             )
             init_tip_world = to_world(init_tip_local, robot_trans.data, robot_rotmat)  # (T, 5, 3)
-            # Find nearest vertex per tip per frame
-            init_diff = init_tip_world.unsqueeze(2) - obj_verts_t.unsqueeze(1)  # (T, 5, V, 3)
-            init_dist_sq = (init_diff ** 2).sum(-1)  # (T, 5, V)
-            _, anchor_idx = init_dist_sq.min(dim=2)  # (T, 5)
-            anchor_gather = anchor_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 3)
-            # Gather target positions and normals
-            target_pos = torch.gather(
-                obj_verts_t.unsqueeze(1).expand(-1, 5, -1, -1), 2, anchor_gather,
-            ).squeeze(2)  # (T, 5, 3)
-            target_nrm = torch.gather(
-                obj_normals_t.unsqueeze(1).expand(-1, 5, -1, -1), 2, anchor_gather,
-            ).squeeze(2)  # (T, 5, 3)
+            anchor_idx = torch.cdist(init_tip_world, obj_verts_t).argmin(dim=2)  # (T, 5)
+            T_idx = torch.arange(T, device=DEVICE).unsqueeze(1).expand(-1, 5)  # (T, 5)
+            target_pos = obj_verts_t[T_idx, anchor_idx]    # (T, 5, 3)
+            target_nrm = obj_normals_t[T_idx, anchor_idx]  # (T, 5, 3)
             # Temporal smoothing (bidirectional EMA) to eliminate frame-to-frame jumps
             alpha = 0.3
             for t in range(1, T):
                 target_pos[t] = alpha * target_pos[t] + (1 - alpha) * target_pos[t - 1]
-                target_nrm[t] = alpha * target_nrm[t] + (1 - alpha) * target_nrm[t - 1]
             for t in range(T - 2, -1, -1):
                 target_pos[t] = alpha * target_pos[t] + (1 - alpha) * target_pos[t + 1]
-                target_nrm[t] = alpha * target_nrm[t] + (1 - alpha) * target_nrm[t + 1]
-            target_nrm = torch.nn.functional.normalize(target_nrm, dim=-1)
+            anchor_idx = torch.cdist(target_pos, obj_verts_t).argmin(dim=2)  # (T, 5)
+            target_pos = obj_verts_t[T_idx, anchor_idx]
+            target_nrm = obj_normals_t[T_idx, anchor_idx]
 
-        for i in range(200):
-            opt4.zero_grad()
+        for i in range(N_ITER):
+            opt2.zero_grad()
 
             # Assemble full joint tensor with current side params
             full_th = robot_th.data.detach().clone()
             full_th[:, opt_indices] = side_params
             full_th = enforce_mimic(full_th, mimic_map)
 
-            # FK → tip positions in world frame
-            body_pos = chain.forward_kinematics(full_th, indices)
+            body_pos = chain.forward_kinematics(full_th, tip_frame_indices)
             tip_local = torch.stack(
                 [body_pos[n].get_matrix()[:, :3, 3] for n in tip_links], dim=1,
             )  # (T, 5, 3)
@@ -522,41 +504,36 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
             unsigned_dist = diff_vec.norm(dim=-1)  # (T, 5)
             signed_dist = (diff_vec * target_nrm).sum(-1)  # (T, 5)
 
-            # Contact attraction: pull tips toward anchored surface point
-            loss_attract = torch.mean(unsigned_dist * mask.unsqueeze(1)) * 50.0
+            loss_attract = (unsigned_dist * mask.unsqueeze(1)).sum() / contact_denom * W_ATTRACT
 
             # Collision penalty: extra penalty for penetration (signed_dist < 0)
             penetration = torch.clamp(-signed_dist, min=0)  # (T, 5)
-            loss_collide = torch.mean(penetration * mask.unsqueeze(1)) * 100.0
+            loss_collide = (penetration * mask.unsqueeze(1)).sum() / contact_denom * W_COLLIDE
 
-            # Prior: stay close to Stage 1 solution
-            # Arm joints (first 7) get tight prior, finger joints (last 6) get loose prior
-            arm_prior = torch.mean((side_params[:, :7] - prior_values[:, :7]) ** 2) * 5.0
-            finger_prior = torch.mean((side_params[:, 7:] - prior_values[:, 7:]) ** 2) * 0.5
-
-            # Joint limits
+            # Joint limits (soft penalty; W_JL must be large enough to dominate
+            # attract gradient near the boundary, otherwise fingers reverse-bend).
             jl = joint_limit_loss(
                 side_params,
                 joint_lower[opt_indices],
                 joint_upper[opt_indices],
-            ) * 10.0
+            ) * W_JL
 
             # Temporal smoothness
-            smooth = torch.mean((side_params[1:] - side_params[:-1]) ** 2) * 0.5
+            smooth = torch.mean((side_params[1:] - side_params[:-1]) ** 2) * W_SMOOTH
 
-            loss = loss_attract + loss_collide + arm_prior + finger_prior + jl + smooth
+            loss = loss_attract + loss_collide + jl + smooth
             loss.backward()
-            opt4.step()
+            opt2.step()
 
             if i % 50 == 0:
                 print(f"  {side} iter {i:3d}  loss={loss.item():.4f}  "
                       f"attract={loss_attract.item():.4f}  collide={loss_collide.item():.4f}  "
-                      f"arm_prior={arm_prior.item():.4f}  finger_prior={finger_prior.item():.4f}")
+                      f"jl={jl.item():.4f}  smooth={smooth.item():.4f}")
 
         # Write back
         with torch.no_grad():
             robot_th.data[:, opt_indices] = side_params.data
-            robot_th.data = enforce_mimic(robot_th.data, mimic_map)
+            robot_th.data.copy_(enforce_mimic(robot_th.data, mimic_map))
 
     # =====================================================================
     # Compute contact labels
