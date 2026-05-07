@@ -1,9 +1,11 @@
 """
-Three-stage humanoid retargeting: body IK + ground alignment + hand retargeting.
+Two-stage humanoid retargeting:
 
-Stage 1: Full body IK matching SMPLX keypoints to G1 links
-Stage 2: Freeze lower body, adjust root Z + upper body for ground alignment
-Stage 3: Freeze body, optimize hand DOFs with vector-based fingertip matching
+Stage 1: GMR-style full body IK + ground contact (per-link weighted pos/ori
+         loss with axis mask, plus ankle-to-ground loss; pelvis xy anchored,
+         z free so the IK lowers G1 to plant feet).
+Stage 2: Contact-aware hand refinement — directly optimizes arm + finger DOFs
+         to satisfy fingertip contact targets on the object mesh.
 """
 
 import os
@@ -15,6 +17,7 @@ import yourdfpy
 import numpy as np
 import pytorch_kinematics as pk
 import xml.etree.ElementTree as ET
+from collections import namedtuple
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as sRot
 
@@ -31,24 +34,34 @@ from utils.cli_args import (
     OBJECTS_PATH, SMPLX_PATH,
     OUTPUT_PATH, G1_PATH, SMPLH_BONE_ORDER_NAMES
 )
+from utils.math import quat_from_angle_axis, matrix_from_quat, quat_fk
+from utils.process import get_smpl_parents
 
 G1_URDF_PATH = os.path.join(G1_PATH, "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf")
 
-# Body link mapping: G1 link -> SMPLX joint
-JOINT_MAP = {
-    "pelvis": "Pelvis",
-    "left_hip_pitch_link": "L_Hip",
-    "left_knee_link": "L_Knee",
-    "left_ankle_roll_link": "L_Ankle",
-    "right_hip_pitch_link": "R_Hip",
-    "right_knee_link": "R_Knee",
-    "right_ankle_roll_link": "R_Ankle",
-    "left_shoulder_roll_link": "L_Shoulder",
-    "left_elbow_link": "L_Elbow",
-    "L_hand_base_link": "L_Wrist",
-    "right_shoulder_roll_link": "R_Shoulder",
-    "right_elbow_link": "R_Elbow",
-    "R_hand_base_link": "R_Wrist",
+IKEntry = namedtuple("IKEntry", "smplh pos_w ori_w rot_off pos_axes")
+IKEntry.__new__.__defaults__ = ((1.0, 1.0, 1.0),)
+
+IK_TARGETS = {
+    # G1 link                  IKEntry( smplh_joint   pos_w  ori_w  rot_offset_wxyz [, pos_axes] )
+    # -- Body links (rot_offset byte-for-byte from GMR ik_match_table1) --
+    # pelvis: pos_axes=(1,1,0) frees z so IK can lower body to plant feet.
+    "pelvis":                  IKEntry("Pelvis",     100, 10, ( 0.5, -0.5, -0.5, -0.5), (1.0, 1.0, 0.0)),
+    "left_hip_roll_link":      IKEntry("L_Hip",        0, 10, ( 0.4267755048530407, -0.5637931078484661, -0.5637931078484661, -0.4267755048530407)),
+    "left_knee_link":          IKEntry("L_Knee",       0, 10, ( 0.5, -0.5, -0.5, -0.5)),
+    "right_hip_roll_link":     IKEntry("R_Hip",        0, 10, ( 0.4267755048530407, -0.5637931078484661, -0.5637931078484661, -0.4267755048530407)),
+    "right_knee_link":         IKEntry("R_Knee",       0, 10, ( 0.5, -0.5, -0.5, -0.5)),
+    "torso_link":              IKEntry("Chest",        0, 10, ( 0.5, -0.5, -0.5, -0.5)),
+    "left_shoulder_yaw_link":  IKEntry("L_Shoulder",   0, 10, ( 0.70710678, 0.0, -0.70710678, 0.0)),
+    "left_elbow_link":         IKEntry("L_Elbow",      0, 10, ( 1.0, 0.0, 0.0, 0.0)),
+    "right_shoulder_yaw_link": IKEntry("R_Shoulder",   0, 10, ( 0.0, 0.70710678, 0.0, 0.70710678)),
+    "right_elbow_link":        IKEntry("R_Elbow",      0, 10, ( 0.0, 0.0, 0.0, -1.0)),
+    # -- HOI wrist anchor: rot_offset = gmr(wrist_yaw) ⊗ R(wrist_yaw -> hand_base) --
+    "L_hand_base_link":        IKEntry("L_Wrist",    100, 10, ( 0.70710678,  0.0,         0.0,         0.70710678)),
+    "R_hand_base_link":        IKEntry("R_Wrist",    100, 10, ( 0.0,        -0.70710678, -0.70710678,  0.0)),
+    # Alternative (ablation): anchor wrist_yaw_link instead of hand_base_link.
+    # "left_wrist_yaw_link":   IKEntry("L_Wrist",    100, 10, ( 1.0, 0.0, 0.0, 0.0)),
+    # "right_wrist_yaw_link":  IKEntry("R_Wrist",    100, 10, ( 0.0, 0.0, 0.0, -1.0)),
 }
 
 # Hand fingertip link mapping: G1 tip link -> SMPLX fingertip joint
@@ -151,6 +164,43 @@ def to_world(pos_local, trans, rotmat):
     return pos_w.squeeze(-1) + trans.unsqueeze(1)
 
 
+def compute_smplx_world_rotations(poses_aa: np.ndarray, gender: str = "neutral") -> np.ndarray:
+    """Compute world rotation matrices for SMPL-X body joints (0-21) via FK on
+    local axis-angle along the SMPL-X kinematic tree."""
+    body_aa = np.asarray(poses_aa[:, :22, :], dtype=np.float32)
+    local_quats = quat_from_angle_axis(body_aa)  # (T, 22, 4) wxyz
+    parents = get_smpl_parents(gender).tolist()
+    chain_quats, _ = quat_fk(local_quats, np.zeros_like(body_aa), parents)
+    return matrix_from_quat(chain_quats)  # (T, 22, 3, 3)
+
+
+def build_ik_targets(table: dict):
+    """Resolve `IK_TARGETS` (`IKEntry` values) into runtime-ready arrays.
+
+    Returns:
+        targets: list of dicts {robot_link, smplh_idx, pos_weight, ori_weight,
+                 rot_offset_R (3, 3)}.
+        pelvis_offset_R: (3, 3) — replaces R_canon at the root so the pelvis
+                 IK target (smplx_pelvis_world @ pelvis_offset) is identically
+                 satisfied at every frame.
+    """
+    targets = []
+    for robot_link, e in table.items():
+        rot_R = sRot.from_quat(np.asarray(e.rot_off, dtype=np.float64),
+                                scalar_first=True).as_matrix()
+        targets.append({
+            "robot_link": robot_link,
+            "smplh_idx": SMPLH_BONE_ORDER_NAMES.index(e.smplh),
+            "pos_weight": float(e.pos_w),
+            "ori_weight": float(e.ori_w),
+            "rot_offset_R": rot_R.astype(np.float32),
+            "pos_axes": np.asarray(e.pos_axes, dtype=np.float32),
+        })
+    pelvis_quat = np.asarray(table["pelvis"].rot_off, dtype=np.float64)
+    pelvis_R = sRot.from_quat(pelvis_quat, scalar_first=True).as_matrix().astype(np.float32)
+    return targets, pelvis_R
+
+
 def compute_contact_labels(
     chain: pk.Chain,
     robot_th: torch.Tensor,
@@ -235,19 +285,47 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
     trans = seq_data["human"]["trans"]
     poses = seq_data["human"]["poses"].reshape(T, -1, 3)
     root_orient = poses[:, 0, :]
-    robot_rot = sRot.from_rotvec(root_orient) * sRot.from_euler(
-        "xyz", [np.pi / 2, 0.0, np.pi / 2]
-    ).inv()
-    robot_rotmat = torch.tensor(robot_rot.as_matrix(), dtype=torch.float32, device=DEVICE)
+    gender = str(seq_data["human"].get("gender", "neutral"))
+
+    ik_targets, pelvis_offset_R = build_ik_targets(IK_TARGETS)
+    pelvis_offset_R_t = torch.tensor(pelvis_offset_R, dtype=torch.float32, device=DEVICE)
+    R_root = torch.tensor(
+        sRot.from_rotvec(root_orient).as_matrix(), dtype=torch.float32, device=DEVICE,
+    )  # (T, 3, 3)
+    robot_rotmat = R_root @ pelvis_offset_R_t  # (T, 3, 3)
 
     # Load object mesh (world-space vertices + normals per frame)
     obj_verts_world, obj_normals_world, _ = load_object_mesh(seq_data)
     print(f"Object mesh loaded: {obj_verts_world.shape[1]} vertices, {T} frames")
 
     # Body link targets
-    robot_link_names = list(JOINT_MAP.keys())
-    smpl_indices = [SMPLH_BONE_ORDER_NAMES.index(n) for n in JOINT_MAP.values()]
-    smpl_keypoints = keypoints[:, smpl_indices, :]
+    robot_link_names = [t["robot_link"] for t in ik_targets]
+    smpl_indices = [t["smplh_idx"] for t in ik_targets]
+    smpl_keypoints = keypoints[:, smpl_indices, :]  # (T, n, 3) — pos targets
+    pos_weights = torch.tensor([t["pos_weight"] for t in ik_targets],
+                                dtype=torch.float32, device=DEVICE)
+    ori_weights = torch.tensor([t["ori_weight"] for t in ik_targets],
+                                dtype=torch.float32, device=DEVICE)
+    pos_axes_mask = torch.tensor(np.stack([t["pos_axes"] for t in ik_targets]),
+                                  dtype=torch.float32, device=DEVICE)  # (n, 3)
+    rot_offsets_R = torch.tensor(np.stack([t["rot_offset_R"] for t in ik_targets]),
+                                  dtype=torch.float32, device=DEVICE)  # (n, 3, 3)
+
+    # Orientation targets: target_world_R[t, n] = smplx_world_R[t, n] @ rot_offset[n]
+    smplx_world_R_np = compute_smplx_world_rotations(poses, gender)  # (T, 22, 3, 3)
+    smplx_world_R = torch.tensor(smplx_world_R_np, dtype=torch.float32, device=DEVICE)
+    smplx_target_R = smplx_world_R[:, smpl_indices]  # (T, n, 3, 3)
+    target_world_R = torch.einsum("tnij,njk->tnik", smplx_target_R, rot_offsets_R)
+
+    # Ground contact: pull G1 ankle down on frames where SMPL-H toe is near ground.
+    foot_link_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
+    G1_ANKLE_TO_SOLE = 0.035
+    GROUND_THRESH = 0.08
+    GROUND_W = 100.0
+    l_toe_idx = SMPLH_BONE_ORDER_NAMES.index("L_Toe")
+    r_toe_idx = SMPLH_BONE_ORDER_NAMES.index("R_Toe")
+    l_contact = (keypoints[:, l_toe_idx, 2] < GROUND_THRESH).float()
+    r_contact = (keypoints[:, r_toe_idx, 2] < GROUND_THRESH).float()
 
     # Joint config
     joint_names = chain.get_joint_parameter_names()
@@ -271,209 +349,73 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         return to_world(local, trans, rotmat)
 
     # =====================================================================
-    # Stage 1: Full body IK
+    # Stage 1: Full body IK + ground contact
     # =====================================================================
     print("=" * 60)
-    print("Stage 1: Full body IK")
+    print("Stage 1: Full body IK + ground contact")
+    pos_active = [
+        (n, w, tuple(a)) for n, w, a in zip(
+            robot_link_names, pos_weights.tolist(), pos_axes_mask.tolist())
+        if w > 0
+    ]
+    ori_active = [(n, w) for n, w in zip(robot_link_names, ori_weights.tolist()) if w > 0]
+    print(f"  pos targets: {pos_active}")
+    print(f"  ori targets: {len(ori_active)} links @ weight 10")
+    print(f"  ground contact: {int(l_contact.sum())}/{T} L, {int(r_contact.sum())}/{T} R frames")
     print("=" * 60)
     opt = torch.optim.Adam([robot_th, robot_trans], lr=0.02)
     for i in range(300):
         opt.zero_grad()
 
-        robot_kp_w = get_body_keypoints(robot_th, robot_trans, robot_rotmat)
-        omega = torch.gradient(robot_th, spacing=1.0 / fps, dim=0)[0]
+        body_pos = chain.forward_kinematics(robot_th, indices)
+        local_pos = torch.stack(
+            [body_pos[name].get_matrix()[:, :3, 3] for name in robot_link_names], dim=1,
+        )  # (T, n, 3)
+        local_R = torch.stack(
+            [body_pos[name].get_matrix()[:, :3, :3] for name in robot_link_names], dim=1,
+        )  # (T, n, 3, 3)
+        foot_local = torch.stack(
+            [body_pos[name].get_matrix()[:, :3, 3] for name in foot_link_names], dim=1,
+        )  # (T, 2, 3)
+        pos_world = (robot_rotmat.unsqueeze(1) @ local_pos.unsqueeze(-1)).squeeze(-1) \
+                    + robot_trans.unsqueeze(1)  # (T, n, 3)
+        rot_world = robot_rotmat.unsqueeze(1) @ local_R  # (T, n, 3, 3)
+        foot_world = (robot_rotmat.unsqueeze(1) @ foot_local.unsqueeze(-1)).squeeze(-1) \
+                     + robot_trans.unsqueeze(1)  # (T, 2, 3)
 
-        kp_loss = torch.mean((robot_kp_w - smpl_keypoints) ** 2)
-        pos_reg = torch.mean(torch.square(robot_th))
+        # Weighted per-link MSE (entries with weight=0 are inert).
+        # pos_axes_mask zeros residual on disabled axes (e.g. pelvis z).
+        pos_diff_sq = (pos_world - smpl_keypoints) ** 2 * pos_axes_mask.unsqueeze(0)
+        pos_per_link = pos_diff_sq.mean(dim=(0, 2))  # (n,)
+        ori_per_link = ((rot_world - target_world_R) ** 2).mean(dim=(0, 2, 3))  # (n,)
+        pos_loss = (pos_per_link * pos_weights).sum()
+        ori_loss = (ori_per_link * ori_weights).sum()
+
+        l_sole_z = foot_world[:, 0, 2] - G1_ANKLE_TO_SOLE
+        r_sole_z = foot_world[:, 1, 2] - G1_ANKLE_TO_SOLE
+        ground_loss = (l_contact * l_sole_z ** 2).mean() \
+                    + (r_contact * r_sole_z ** 2).mean()
+
+        omega = torch.gradient(robot_th, spacing=1.0 / fps, dim=0)[0]
         vel_reg = torch.mean(torch.square(omega))
         jl_loss = joint_limit_loss(robot_th, joint_lower, joint_upper)
-        loss = kp_loss + 2e-2 * pos_reg + 1e-3 * vel_reg + 10.0 * jl_loss
+
+        loss = pos_loss + ori_loss + GROUND_W * ground_loss \
+             + 1e-3 * vel_reg + 10.0 * jl_loss
 
         loss.backward()
         opt.step()
 
         if i % 50 == 0:
-            print(f"  iter {i:3d}  loss={loss.item():.6f}  kp={kp_loss.item():.6f}  "
-                  f"j_pos={pos_reg.item():.6f}  j_vel={vel_reg.item():.6f}  j_lim={jl_loss.item():.6f}")
+            print(f"  iter {i:3d}  loss={loss.item():.4f}  "
+                  f"pos={pos_loss.item():.4f}  ori={ori_loss.item():.4f}  "
+                  f"ground={ground_loss.item():.5f}  jl={jl_loss.item():.4f}")
 
     # =====================================================================
-    # Stage 2: Ground alignment (freeze lower body)
-    # =====================================================================
-    print("=" * 60)
-    print("Stage 2: Ground alignment")
-    print("=" * 60)
-    G1_ANKLE_TO_SOLE = 0.035
-    # Freeze legs (0-11) + waist (12-14) to preserve torso orientation from Stage 1
-    FROZEN_JOINTS = 15
-
-    l_hand_idx = robot_link_names.index("L_hand_base_link")
-    r_hand_idx = robot_link_names.index("R_hand_base_link")
-    l_ankle_idx = robot_link_names.index("left_ankle_roll_link")
-    r_ankle_idx = robot_link_names.index("right_ankle_roll_link")
-
-    GROUND_THRESH = 0.08
-    l_toe_idx = SMPLH_BONE_ORDER_NAMES.index("L_Toe")
-    r_toe_idx = SMPLH_BONE_ORDER_NAMES.index("R_Toe")
-    l_contact = (keypoints[:, l_toe_idx, 2] < GROUND_THRESH).float()
-    r_contact = (keypoints[:, r_toe_idx, 2] < GROUND_THRESH).float()
-
-    with torch.no_grad():
-        stage1_kp = get_body_keypoints(robot_th, robot_trans, robot_rotmat)
-        ee_targets = stage1_kp.detach().clone()
-
-    lower_th = robot_th.data[:, :FROZEN_JOINTS].detach().clone()
-    upper_th = torch.nn.Parameter(robot_th.data[:, FROZEN_JOINTS:].detach().clone())
-    root_z_offset = torch.nn.Parameter(torch.zeros(T, 1, device=DEVICE))
-    opt2 = torch.optim.Adam([upper_th, root_z_offset], lr=0.01)
-
-    for i in range(300):
-        opt2.zero_grad()
-
-        full_th = torch.cat([lower_th, upper_th], dim=1)
-        adjusted_trans = robot_trans.detach().clone()
-        adjusted_trans[:, 2:3] += root_z_offset
-
-        robot_kp_w = get_body_keypoints(full_th, adjusted_trans, robot_rotmat)
-
-        ee_loss = torch.mean((robot_kp_w[:, l_hand_idx, :] - ee_targets[:, l_hand_idx, :]) ** 2) \
-                + torch.mean((robot_kp_w[:, r_hand_idx, :] - ee_targets[:, r_hand_idx, :]) ** 2)
-
-        l_sole_z = robot_kp_w[:, l_ankle_idx, 2] - G1_ANKLE_TO_SOLE
-        r_sole_z = robot_kp_w[:, r_ankle_idx, 2] - G1_ANKLE_TO_SOLE
-        ground_loss = torch.mean(l_contact * l_sole_z ** 2) \
-                    + torch.mean(r_contact * r_sole_z ** 2)
-
-        omega = torch.gradient(upper_th, spacing=1.0 / fps, dim=0)[0]
-        pos_reg = torch.mean(torch.square(upper_th))
-        vel_reg = torch.mean(torch.square(omega))
-        jl_loss = joint_limit_loss(upper_th, joint_lower[FROZEN_JOINTS:], joint_upper[FROZEN_JOINTS:])
-
-        loss = 10.0 * ee_loss + 5.0 * ground_loss \
-             + 2e-2 * pos_reg + 1e-3 * vel_reg + 10.0 * jl_loss
-
-        loss.backward()
-        opt2.step()
-
-        if i % 50 == 0:
-            print(f"  iter {i:3d}  loss={loss.item():.6f}  ee={ee_loss.item():.6f}  "
-                  f"ground={ground_loss.item():.6f}  j_lim={jl_loss.item():.6f}")
-
-    # Merge stage 2 results
-    with torch.no_grad():
-        robot_th.data = torch.cat([lower_th, upper_th.data], dim=1)
-        robot_trans.data[:, 2:3] += root_z_offset.data
-
-    # =====================================================================
-    # Stage 3: Hand retargeting (geometric angle-based, ins-dex approach)
+    # Stage 2: Contact-aware hand refinement
     # =====================================================================
     print("=" * 60)
-    print("Stage 3: Hand retargeting (angle-based)")
-    print("=" * 60)
-
-    kp_np = keypoints.detach().cpu().numpy()  # (T, 52, 3)
-
-    def _angle_at(kp_frame, origin, p1, p2):
-        """Angle in degrees at origin between vectors to p1 and p2."""
-        v1 = kp_frame[p1] - kp_frame[origin]
-        v2 = kp_frame[p2] - kp_frame[origin]
-        cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
-        return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
-
-    def _linear_map(angle, src_low, src_high, dst_low, dst_high):
-        """Linearly map angle from [src_low, src_high] to [dst_low, dst_high], clamped."""
-        t = (angle - src_low) / (src_high - src_low + 1e-8)
-        return np.clip(dst_low + t * (dst_high - dst_low), min(dst_low, dst_high), max(dst_low, dst_high))
-
-    # SMPLX angle limits (calibrated via scripts/calibrate_hand_angles.py)
-    # Four fingers: angle at {Finger}1 between Wrist and {Finger}3
-    FOUR_FINGER_OPEN = 172.1
-    FOUR_FINGER_CLOSED = 52.0
-
-    # Thumb bending: angle at Thumb1 between Thumb3 and Index1
-    THUMB_BEND_OPEN = 54.4
-    THUMB_BEND_CLOSED = 7.4
-
-    # Thumb rotation: angle at Thumb1 between Thumb3 and Middle1
-    # Note: small range (~6°) — thumb yaw sensitivity is limited with this metric
-    THUMB_ROT_OPEN = 71.5
-    THUMB_ROT_CLOSED = 65.2
-
-    # Robot joint limits (from URDF)
-    # Four fingers proximal: [0.0, 1.7] rad
-    # Thumb yaw: [-0.1, 1.3] rad
-    # Thumb pitch: [-0.1, 0.6] rad
-
-    hand_joint_values = np.zeros((T, chain.n_joints))
-
-    for side in ['L', 'R']:
-        w_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_Wrist')
-        i1_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_Index1')
-        m1_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_Middle1')
-        t1_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_Thumb1')
-        t3_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_Thumb3')
-
-        for t in range(T):
-            frame = kp_np[t]
-
-            # --- Four fingers: index, middle, ring, pinky ---
-            for finger in ['Index', 'Middle', 'Ring', 'Pinky']:
-                f1_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_{finger}1')
-                f3_idx = SMPLH_BONE_ORDER_NAMES.index(f'{side}_{finger}3')
-                # Flexion angle at proximal joint
-                angle = _angle_at(frame, f1_idx, w_idx, f3_idx)
-                # Map: open (170°) -> 0 rad, closed (40°) -> 1.7 rad
-                joint_val = _linear_map(angle, FOUR_FINGER_OPEN, FOUR_FINGER_CLOSED, 0.0, 1.7)
-
-                joint_name = f'{side}_{finger.lower()}_proximal_joint'
-                j_idx = joint_names.index(joint_name)
-                hand_joint_values[t, j_idx] = joint_val
-
-            # --- Thumb bending (pitch) ---
-            # Angle at Thumb1 between Thumb3 and Index1
-            bend_angle = _angle_at(frame, t1_idx, t3_idx, i1_idx)
-            thumb_pitch = _linear_map(bend_angle, THUMB_BEND_OPEN, THUMB_BEND_CLOSED, -0.1, 0.6)
-
-            pitch_name = f'{side}_thumb_proximal_pitch_joint'
-            hand_joint_values[t, joint_names.index(pitch_name)] = thumb_pitch
-
-            # --- Thumb rotation (yaw) ---
-            # Angle at Thumb1 between Thumb3 and Middle1
-            rot_angle = _angle_at(frame, t1_idx, t3_idx, m1_idx)
-            thumb_yaw = _linear_map(rot_angle, THUMB_ROT_OPEN, THUMB_ROT_CLOSED, -0.1, 1.3)
-
-            yaw_name = f'{side}_thumb_proximal_yaw_joint'
-            hand_joint_values[t, joint_names.index(yaw_name)] = thumb_yaw
-
-        print(f"  {side} hand done")
-
-    # Apply temporal smoothing (exponential moving average)
-    alpha = 0.7  # smoothing factor: higher = less smoothing
-    for side in ['L', 'R']:
-        for j_idx_val in hand_indep[side]:
-            for t in range(1, T):
-                hand_joint_values[t, j_idx_val] = (
-                    alpha * hand_joint_values[t, j_idx_val]
-                    + (1 - alpha) * hand_joint_values[t - 1, j_idx_val]
-                )
-
-    # Write hand joints into robot_th and enforce mimic
-    with torch.no_grad():
-        hand_th_tensor = torch.tensor(hand_joint_values, dtype=torch.float32, device=DEVICE)
-        for side in ['L', 'R']:
-            for j_idx_val in hand_indep[side]:
-                robot_th.data[:, j_idx_val] = hand_th_tensor[:, j_idx_val]
-        robot_th.data = enforce_mimic(robot_th.data, mimic_map)
-
-    # Print sample values
-    for side in ['L', 'R']:
-        vals = {joint_names[j]: robot_th.data[0, j].item() for j in hand_indep[side]}
-        print(f"  {side} frame 0: " + "  ".join(f"{k.split('_',1)[1][:12]}={v:.3f}" for k, v in vals.items()))
-
-    # =====================================================================
-    # Stage 4: Contact-aware hand refinement
-    # =====================================================================
-    print("=" * 60)
-    print("Stage 4: Contact-aware hand refinement")
+    print("Stage 2: Contact-aware hand refinement")
     print("=" * 60)
 
     # Build SMPLX contact mask: (T, 5) per side — True when any fingertip should contact
@@ -520,7 +462,7 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         # Indices of joints to optimize: arm (7) + independent finger (6) = 13
         opt_indices = arm_joint_indices[side] + hand_indep[side]
 
-        # Save Stage 1-3 values as prior targets
+        # Save Stage 1 values as prior targets
         prior_values = robot_th.data[:, opt_indices].detach().clone()
 
         # Create optimizable parameter for this side's joints
@@ -530,7 +472,7 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
         mask = contact_mask[side]  # (T,)
         tip_links = g1_tip_links[side]
 
-        # Precompute smoothed target positions from Stage 3 pose
+        # Precompute smoothed target positions from Stage 1 pose
         with torch.no_grad():
             init_th = enforce_mimic(robot_th.data.clone(), mimic_map)
             init_body = chain.forward_kinematics(init_th, indices)
@@ -587,7 +529,7 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
             penetration = torch.clamp(-signed_dist, min=0)  # (T, 5)
             loss_collide = torch.mean(penetration * mask.unsqueeze(1)) * 100.0
 
-            # Prior: stay close to Stage 1-3 solution
+            # Prior: stay close to Stage 1 solution
             # Arm joints (first 7) get tight prior, finger joints (last 6) get loose prior
             arm_prior = torch.mean((side_params[:, :7] - prior_values[:, :7]) ** 2) * 5.0
             finger_prior = torch.mean((side_params[:, 7:] - prior_values[:, 7:]) ** 2) * 0.5
