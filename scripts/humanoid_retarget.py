@@ -39,6 +39,8 @@ from utils.process import get_smpl_parents
 
 G1_URDF_PATH = os.path.join(G1_PATH, "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf")
 
+FPS = 30
+
 IKEntry = namedtuple("IKEntry", "smplh pos_w ori_w rot_off pos_axes")
 IKEntry.__new__.__defaults__ = ((1.0, 1.0, 1.0),)
 
@@ -237,7 +239,7 @@ def compute_contact_labels(
 
 
 # =============================================================================
-# Three-stage retargeting
+# Two-stage retargeting
 # =============================================================================
 
 def load_object_mesh(seq_data: dict):
@@ -262,7 +264,7 @@ def load_object_mesh(seq_data: dict):
     return obj_verts_world, obj_normals_world, obj_verts
 
 
-def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
+def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
     keypoints = torch.tensor(seq_data["human"]["keypoints"], dtype=torch.float32, device=DEVICE)
     T = keypoints.shape[0]
 
@@ -562,7 +564,7 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = 30):
 # Visualization
 # =============================================================================
 
-def visualize_retarget(results: dict, seq_data: dict, chain: pk.Chain, fps: int = 30):
+def visualize_retarget(results: dict, seq_data: dict, chain: pk.Chain, fps: int = FPS):
     import viser
     import viser.transforms as vtf
     from viser.extras import ViserUrdf
@@ -641,7 +643,7 @@ def visualize_retarget(results: dict, seq_data: dict, chain: pk.Chain, fps: int 
         if not gui_playing.value:
             _update_frame(gui_frame.value)
 
-    print("Playing visualization... (open browser at http://localhost:8012)")
+    print(f"Playing visualization... (open browser at http://localhost:{server.get_port()})")
     print("  Controls: Playing/pause, Frame slider, Record Video button")
 
     t = 0
@@ -679,14 +681,14 @@ def main():
             print(f"\nRetargeting {seq_name} with {object_name}")
             print("=" * 60)
 
-            results = run_retarget(chain, seq_data)
+            results = run_retarget(chain, seq_data, fps=FPS)
 
             os.makedirs(out_dir, exist_ok=True)
             joblib.dump(results, out_file)
             print(f"\nSaved to {out_file}")
 
             if args.visualize:
-                visualize_retarget(results, seq_data, chain)
+                visualize_retarget(results, seq_data, chain, fps=FPS)
 
     merged = {}
     for object_name in sorted(os.listdir(retarget_root)):
