@@ -36,10 +36,14 @@ from utils.cli_args import (
 )
 from utils.math import quat_from_angle_axis, matrix_from_quat, quat_fk
 from utils.process import get_smpl_parents
+from utils.force_closure import make_wrench_dirs, fc_margin_batch
 
 G1_URDF_PATH = os.path.join(G1_PATH, "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf")
 
 FPS = 30
+
+W_VEL = 0.1
+W_ACC = 0.02
 
 IKEntry = namedtuple("IKEntry", "smplh pos_w ori_w rot_off pos_axes")
 IKEntry.__new__.__defaults__ = ((1.0, 1.0, 1.0),)
@@ -253,6 +257,11 @@ def load_object_mesh(seq_data: dict):
     obj = seq_data["object"]
     obj_name = str(obj["name"])
     mesh = trimesh.load(os.path.join(OBJECTS_PATH, f"{obj_name}.obj"), force="mesh")
+
+    target_verts = 2048
+    target_faces = max(int(len(mesh.faces) * target_verts / len(mesh.vertices)), 4)
+    mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+
     obj_verts = np.asarray(mesh.vertices, dtype=np.float32)  # (V, 3)
     obj_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)  # (V, 3)
     obj_rot = obj["rot"]    # (T, 3, 3)
@@ -372,15 +381,22 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
         ground_loss = (l_contact * l_sole_z ** 2).mean() \
                     + (r_contact * r_sole_z ** 2).mean()
 
-        omega = torch.gradient(robot_th, spacing=1.0 / fps, dim=0)[0]
-        vel_reg = torch.mean(torch.square(omega))
+        vel = (robot_th[1:] - robot_th[:-1]) * fps                          # rad/s
+        acc = (robot_th[2:] - 2 * robot_th[1:-1] + robot_th[:-2]) * (fps ** 2)  # rad/s^2
+        vel_reg = torch.mean(vel ** 2)
+        acc_reg = torch.mean(acc ** 2)
         jl_loss = joint_limit_loss(robot_th, joint_lower, joint_upper)
 
         loss = pos_loss + ori_loss + GROUND_W * ground_loss \
-             + 1e-3 * vel_reg + 10.0 * jl_loss
+             + W_VEL * vel_reg + W_ACC * acc_reg + 10.0 * jl_loss
 
         loss.backward()
         opt.step()
+
+        with torch.no_grad():
+            robot_th.data.copy_(
+                torch.maximum(torch.minimum(robot_th.data, joint_upper), joint_lower)
+            )
 
         if i % 50 == 0:
             print(f"  iter {i:3d}  loss={loss.item():.4f}  "
@@ -395,9 +411,18 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
     print("=" * 60)
 
     # Loss weights and optimizer config for the per-iter optimization.
-    W_ATTRACT, W_COLLIDE = 50.0, 500.0
+    # SynManDex Eq 6 structure: weak attract (establish contact) + force-closure
+    # objective (-Q_FC, the real driver) + seed regularization (stay near the
+    # Stage-1 arm / relaxed-open finger seed) + collision (no penetration).
+    W_ATTRACT, W_COLLIDE = 25.0, 500.0
+    W_FC = 50.0
+    W_SEED_ARM, W_SEED_FINGER = 5.0, 0.1
     W_JL, W_SMOOTH = 1000.0, 0.5
     N_ITER, LR = 300, 0.005
+    FC_PROX = 0.02  # (m) a fingertip counts as contact for FC only within this
+
+    # Fixed test wrench directions for the differentiable FC margin.
+    fc_w_dirs = make_wrench_dirs(D=64, device=DEVICE, seed=0)
 
     # Warm-start hand joints at the midpoint of joint range
     with torch.no_grad():
@@ -415,13 +440,15 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
               ["R_Thumb3", "R_Index3", "R_Middle3", "R_Ring3", "R_Pinky3"]],
     }
     
-    # Per-side: (T,) — True if ANY fingertip has contact in that frame
+    # Per-side: (T,) frame mask (any fingertip) + (T, 5) per-finger contact mask.
     contact_mask = {}
+    finger_contact = {}
     for side in ["L", "R"]:
         side_contacts = smplx_contacts[:, smplx_tip_indices[side]]  # (T, 5)
-        contact_mask[side] = torch.tensor(
-            np.any(side_contacts > 0, axis=1), dtype=torch.float32, device=DEVICE,
-        )  # (T,)
+        finger_contact[side] = torch.tensor(
+            side_contacts > 0, dtype=torch.float32, device=DEVICE,
+        )  # (T, 5) — per-finger
+        contact_mask[side] = (finger_contact[side].sum(dim=1) > 0).float()  # (T,)
         n_active = int(contact_mask[side].sum().item())
         print(f"  {side} hand: {n_active}/{T} frames with SMPLX fingertip contact")
 
@@ -451,43 +478,46 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
         # Indices of joints to optimize: arm (7) + independent finger (6) = 13
         opt_indices = arm_joint_indices[side] + hand_indep[side]
 
-        # Init from Stage 1 pose; no anchor prior — attract/collide drive the
-        # arm + finger configuration freely, only constrained by joint limits
-        # and temporal smoothness.
-        side_params = torch.nn.Parameter(
-            robot_th.data[:, opt_indices].detach().clone()
-        )
+        # Seed = Stage-1 arm pose + relaxed-open fingers (warm-started above).
+        # Force-closure optimization stays near this seed (SynManDex Eq 6
+        # w_r||q-q_init||^2): strong anchor on the arm (preserve the human
+        # basin), weak on fingers (let them close to ground contact).
+        seed_ref = robot_th.data[:, opt_indices].detach().clone()
+        side_params = torch.nn.Parameter(seed_ref.clone())
         opt2 = torch.optim.Adam([side_params], lr=LR)
 
+        n_arm = len(arm_joint_indices[side])
+        seed_w = torch.full((len(opt_indices),), W_SEED_FINGER, device=DEVICE)
+        seed_w[:n_arm] = W_SEED_ARM  # arm joints come first in opt_indices
+
         mask = contact_mask[side]  # (T,)
-        contact_denom = mask.sum() * 5 + 1e-8
+        m5 = finger_contact[side]  # (T, 5) per-finger contact
+        attract_denom = m5.sum() + 1e-8
 
         tip_links = g1_tip_links[side]
         tip_frame_indices = chain.get_frame_indices(*tip_links)
 
-        # Precompute smoothed target positions from Stage 1 pose
+        # Contact target from the HUMAN fingertips (transfer the human contact
+        # basin), not from G1's own nearest surface point. Smoothed continuously
+        # (no argmin re-snap) to avoid frame-to-frame jumps.
+        human_tips = keypoints[:, smplx_tip_indices[side], :]  # (T, 5, 3)
         with torch.no_grad():
-            init_th = enforce_mimic(robot_th.data, mimic_map)  # enforce_mimic clones internally
-            init_body = chain.forward_kinematics(init_th, tip_frame_indices)
-            init_tip_local = torch.stack(
-                [init_body[n].get_matrix()[:, :3, 3] for n in tip_links], dim=1,
-            )
-            init_tip_world = to_world(init_tip_local, robot_trans.data, robot_rotmat)  # (T, 5, 3)
-            anchor_idx = torch.cdist(init_tip_world, obj_verts_t).argmin(dim=2)  # (T, 5)
+            anchor_idx = torch.cdist(human_tips, obj_verts_t).argmin(dim=2)  # (T, 5)
             T_idx = torch.arange(T, device=DEVICE).unsqueeze(1).expand(-1, 5)  # (T, 5)
             target_pos = obj_verts_t[T_idx, anchor_idx]    # (T, 5, 3)
-            target_nrm = obj_normals_t[T_idx, anchor_idx]  # (T, 5, 3)
-            # Temporal smoothing (bidirectional EMA) to eliminate frame-to-frame jumps
+            target_nrm = obj_normals_t[T_idx, anchor_idx]  # (T, 5, 3) outward
             alpha = 0.3
             for t in range(1, T):
                 target_pos[t] = alpha * target_pos[t] + (1 - alpha) * target_pos[t - 1]
+                target_nrm[t] = alpha * target_nrm[t] + (1 - alpha) * target_nrm[t - 1]
             for t in range(T - 2, -1, -1):
                 target_pos[t] = alpha * target_pos[t] + (1 - alpha) * target_pos[t + 1]
-            anchor_idx = torch.cdist(target_pos, obj_verts_t).argmin(dim=2)  # (T, 5)
-            target_pos = obj_verts_t[T_idx, anchor_idx]
-            target_nrm = obj_normals_t[T_idx, anchor_idx]
+                target_nrm[t] = alpha * target_nrm[t] + (1 - alpha) * target_nrm[t + 1]
+            target_nrm = target_nrm / (target_nrm.norm(dim=-1, keepdim=True) + 1e-9)
+            inward_nrm = -target_nrm                           # finger pushes inward
+            obj_com = obj_verts_t.mean(dim=1)                  # (T, 3)
 
-        for i in range(N_ITER):
+        for i in range(1000):
             opt2.zero_grad()
 
             # Assemble full joint tensor with current side params
@@ -501,19 +531,34 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
             )  # (T, 5, 3)
             tip_world = to_world(tip_local, robot_trans.data, robot_rotmat)  # (T, 5, 3)
 
-            # Distance from each tip to its smoothed target point on the object
             diff_vec = tip_world - target_pos  # (T, 5, 3)
             unsigned_dist = diff_vec.norm(dim=-1)  # (T, 5)
             signed_dist = (diff_vec * target_nrm).sum(-1)  # (T, 5)
 
-            loss_attract = (unsigned_dist * mask.unsqueeze(1)).sum() / contact_denom * W_ATTRACT
+            # Weak attract: just bring contact fingertips onto the object.
+            loss_attract = (unsigned_dist * m5).sum() / attract_denom * W_ATTRACT
 
-            # Collision penalty: extra penalty for penetration (signed_dist < 0)
+            # Collision: penalize penetration for ALL fingers (signed_dist < 0).
             penetration = torch.clamp(-signed_dist, min=0)  # (T, 5)
-            loss_collide = (penetration * mask.unsqueeze(1)).sum() / contact_denom * W_COLLIDE
+            loss_collide = penetration.mean() * W_COLLIDE
 
-            # Joint limits (soft penalty; W_JL must be large enough to dominate
-            # attract gradient near the boundary, otherwise fingers reverse-bend).
+            # Force closure (the real driver): maximize the wrench margin on the
+            # frames that have enough contacts. Gate each finger's contribution
+            # by actual proximity so the margin can't be "won" with fingertips
+            # floating off the surface (must establish contact to count).
+            near = (unsigned_dist.detach() < FC_PROX).float()  # (T,5) binary contact gate
+            fc_cw = m5 * near
+            qhat = fc_margin_batch(
+                tip_world, inward_nrm, obj_com, fc_cw, fc_w_dirs,
+                mu=0.5, beta=20.0,
+            )  # (T,)
+            fc_fw = (fc_cw.sum(dim=1) >= 3).float()
+            loss_fc = -(qhat * fc_fw).sum() / (fc_fw.sum() + 1e-8) * W_FC
+
+            # Seed regularization: stay near the Stage-1 arm / open-finger seed.
+            loss_seed = (((side_params - seed_ref) ** 2) * seed_w).mean()
+
+            # Joint limits (soft penalty; W_JL keeps fingers off the reverse-bend).
             jl = joint_limit_loss(
                 side_params,
                 joint_lower[opt_indices],
@@ -523,14 +568,16 @@ def run_retarget(chain: pk.Chain, seq_data: dict, fps: int = FPS):
             # Temporal smoothness
             smooth = torch.mean((side_params[1:] - side_params[:-1]) ** 2) * W_SMOOTH
 
-            loss = loss_attract + loss_collide + jl + smooth
+            loss = loss_attract + loss_collide + loss_fc + loss_seed + jl + smooth
             loss.backward()
             opt2.step()
 
             if i % 50 == 0:
+                fc_rate = (qhat[fc_fw > 0] > 0).float().mean().item() if fc_fw.sum() > 0 else 0.0
                 print(f"  {side} iter {i:3d}  loss={loss.item():.4f}  "
                       f"attract={loss_attract.item():.4f}  collide={loss_collide.item():.4f}  "
-                      f"jl={jl.item():.4f}  smooth={smooth.item():.4f}")
+                      f"fc={loss_fc.item():.4f}(rate={fc_rate*100:.0f}%)  "
+                      f"seed={loss_seed.item():.4f}  jl={jl.item():.4f}  smooth={smooth.item():.4f}")
 
         # Write back
         with torch.no_grad():
